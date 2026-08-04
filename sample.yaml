@@ -1,0 +1,25 @@
+sample:
+  description: Drive the HTTP server with bare data buffers, without a network stack
+  name: http_server_bare_sample
+common:
+  harness: console
+  harness_config:
+    type: multi_line
+    ordered: true
+    regex:
+      - "feeding 49 bytes in two chunks"
+      - "138 bytes from the HTTP server"
+      - "connection closed by the server"
+      - "feeding 55 bytes in two chunks"
+      - "bytes from the HTTP server"
+      - "connection closed by the server"
+      - "Done"
+  tags:
+    - http
+    - net
+    - server
+    - socket
+  integration_platforms:
+    - native_sim
+tests:
+  sample.net.sockets.http.server.bare: {}
