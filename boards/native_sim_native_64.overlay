@@ -1,0 +1,16 @@
+/*
+ * Copyright (c) 2026 Zephyr Project contributors
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/ {
+	aliases {
+		/* uart0 stays on the console so the logs remain readable. */
+		http-uart = &uart1;
+	};
+};
+
+&uart1 {
+	status = "okay";
+};

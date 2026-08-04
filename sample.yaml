@@ -1,5 +1,6 @@
 sample:
-  description: Drive the HTTP server with bare data buffers, without a network stack
+  description: Drive the HTTP server over a UART with bare data buffers, without a
+    network stack
   name: http_server_bare_sample
 common:
   harness: console
@@ -7,18 +8,20 @@ common:
     type: multi_line
     ordered: true
     regex:
-      - "feeding 49 bytes in two chunks"
-      - "138 bytes from the HTTP server"
-      - "connection closed by the server"
-      - "feeding 55 bytes in two chunks"
-      - "bytes from the HTTP server"
-      - "connection closed by the server"
-      - "Done"
+      - "UART .* wired to the HTTP server"
+      - "request 1: feeding .* bytes in two chunks"
+      - "connection still up: yes"
+      - "request 2: feeding .* bytes in two chunks"
+      - "connection still up: yes"
+      - "request 3: feeding .* bytes in two chunks"
+      - "connection still up: yes"
+      - "Self-test done"
   tags:
     - http
     - net
     - server
     - socket
+    - uart
   integration_platforms:
     - native_sim
 tests:

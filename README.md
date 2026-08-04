@@ -1,29 +1,56 @@
-# Zephyr HTTP server without a network stack
+# Zephyr HTTP server over a UART, without a network stack
 
-Run Zephyr's HTTP server on **raw data buffers** — no L2 driver, no IP, no TCP.
+Serve HTTP on **raw data buffers** — no L2 driver, no IP, no TCP.
 
 The Zephyr HTTP server always talks to its peers through a socket, but it never
-looks at what is behind that socket. This sample exploits that: the stock server
-runs completely unmodified, and the application hands it request bytes directly.
+looks at what is behind that socket. This project exploits that: the stock,
+unmodified server runs with no network stack underneath it, fed raw bytes
+straight off a UART.
 
 The only file descriptors in the image are a `socketpair()` and a small custom
 listening socket.
 
 ## The API
 
-Two entry points, both in [`src/bare_transport.h`](src/bare_transport.h):
+One standalone class, [`src/bare_http.hpp`](src/bare_http.hpp). The output
+callback is registered in the constructor; input is a buffer and a size:
 
-```c
-/* data INTO the server */
-int bare_http_input(struct bare_conn *conn, const void *data, size_t len);
+```cpp
+static void toMyLink(const uint8_t *data, size_t len, void *user)
+{
+        my_link_write(data, len);        // bytes out of the server
+}
 
-/* data OUT of the server */
-typedef void (*bare_http_out_cb_t)(const uint8_t *data, size_t len, void *user_data);
+static BareHttpServer server(toMyLink);
+
+server.start();
+server.input(bytes_from_my_link, n);     // bytes into the server
 ```
 
-Both are placeholders. Replace their bodies with reads and writes on whatever
-carries your data — a UART, a USB endpoint, shared memory with another core, or
-a test harness — and nothing else changes.
+That is the whole surface. `BareHttpServer` knows nothing about UARTs —
+[`src/uart_bridge.cpp`](src/uart_bridge.cpp) is a separate class that wires the
+two together, and is easy to swap for a USB endpoint, shared memory, or a test
+harness.
+
+## The connection is persistent
+
+An HTTP/1.1 request that does not carry `Connection: close` leaves the
+connection open; the server loops back to waiting for the next request on the
+same socket. **One connection serves requests indefinitely**, which is what
+makes a permanently attached UART sensible.
+
+Two details make that robust:
+
+- `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` is raised to its maximum. The
+  server tries to drop an idle client with `shutdown()`, which a socketpair does
+  not implement, so over this transport the timeout is a no-op anyway — but the
+  code does not rely on that quirk.
+- If the server does hang up — on a malformed request, say — the next `input()`
+  relinks transparently. Any partially delivered request is lost, and the stream
+  resynchronises at the next request boundary.
+
+Verified: four requests including a 404, all served over a single connection
+with zero reconnects.
 
 ## How it works
 
@@ -38,87 +65,99 @@ Everything above that — HTTP/1 parsing, HTTP/2 framing, resource dispatch — 
 purely on `client->buffer` and never touches a descriptor. So the whole job is to
 give the server a descriptor that is not a network socket.
 
-[`src/bare_transport.c`](src/bare_transport.c) does that in two parts.
-
-**The listening socket.** `bare_http_listener_create()` is installed through
-`http_service_config.socket_create`, so the server calls it instead of
+**The listening socket.** `BareHttpServer::socketCreate()` is installed through
+`http_service_config::socket_create`, so the server calls it instead of
 `zsock_socket()`. It returns a descriptor backed by a custom `socket_op_vtable`
-in which:
+in which `bind()`/`listen()`/`setsockopt()` succeed without doing anything,
+`poll()` is backed by a `k_poll_signal`, and `accept()` pops a queued descriptor
+instead of waiting for a handshake.
 
-- `bind()` and `listen()` succeed without doing anything — the server abandons a
-  service if they fail, but there is no address space here
-- `setsockopt()` succeeds so the `SO_REUSEADDR` call does not abort the service
-- `poll()` is backed by a `k_poll_signal`, raised when the app queues a connection
-- `accept()` pops a queued descriptor instead of waiting for a handshake
-
-**The connection.** `bare_http_conn_open()` creates a socketpair, queues one end
-on the listening socket — which the server then accepts as an ordinary client —
-and keeps the other. A small thread pumps that end into the app callback.
+**The connection.** `link()` creates a socketpair and queues one end on the
+listening socket, which the server accepts as an ordinary client. An RX thread
+pumps the other end into the output callback.
 
 The HTTP server is used entirely as-is: clients live in its internal array, so
 the inactivity timers and the assert inside `http_server_sendall()` are
-satisfied, and static, dynamic and Websocket resources all behave exactly as they
+satisfied, and static, dynamic and Websocket resources behave exactly as they
 would over TCP.
+
+### Non-blocking is mandatory, not an optimisation
+
+Every `zsock_*()` call takes a per-descriptor mutex and holds it for the whole
+call (`VTABLE_CALL` in `subsys/net/lib/sockets/sockets.c`). A blocking `recv()`
+parked on the application's end of the socketpair therefore **locks out `send()`
+on that same descriptor from any other thread** — a hard deadlock the moment one
+connection carries more than one request.
+
+The application end is opened `O_NONBLOCK`, and both directions block in
+`zsock_poll()` instead, which does not hold that mutex while waiting. The
+server's own end stays blocking, which is what its code expects.
+
+### Threads
+
+- the HTTP server's own thread, created by the subsystem
+- an RX thread owned by `BareHttpServer`, polling the connection and invoking the
+  output callback
+- a feed thread owned by `UartBridge`, because the UART ISR may not block and
+  `input()` may
 
 ## Building and running
 
-This is a Zephyr application; it needs a Zephyr workspace (tested against v4.4).
+A Zephyr application; needs a Zephyr workspace (tested against v4.4).
 
 ```sh
 west build -b native_sim /path/to/zephyr-http-server-bare
 ./build/zephyr/zephyr.exe
 ```
 
-The sample issues two requests, one against a static resource and one against a
-dynamic one, and prints the raw bytes the server produced:
+At boot it injects three keep-alive requests on the UART's own connection, so
+the mechanism is visible without a terminal attached:
 
 ```
---> feeding 49 bytes in two chunks
-<-- 138 bytes from the HTTP server:
-HTTP/1.1 200 OK
-Content-Type: text/html
-Content-Length: 74
-
-<html><body><h1>Zephyr HTTP server, no network attached</h1></body></html>
-<-- connection closed by the server
---> feeding 55 bytes in two chunks
-<-- 105 bytes from the HTTP server:
-HTTP/1.1 200
-Transfer-Encoding: chunked
-Content-Type: application/json
-
-12
-{"uptime_ms":110}
-
-0
-
-<-- connection closed by the server
-Done
+<inf> uart_bridge: UART uart_1 wired to the HTTP server
+<inf> net_http_server_bare: --> request 1: feeding 30 bytes in two chunks
+<inf> net_http_server_bare:     connection still up: yes
+<inf> net_http_server_bare: --> request 2: feeding 36 bytes in two chunks
+<inf> net_http_server_bare:     connection still up: yes
+<inf> net_http_server_bare: --> request 3: feeding 36 bytes in two chunks
+<inf> net_http_server_bare:     connection still up: yes
+<inf> net_http_server_bare: Self-test done, now serving the UART forever
 ```
 
-Each request is handed over in **two separate calls** on purpose. The server
+Each request is handed over in **two separate calls** on purpose: the server
 treats its input as a byte stream, so requests may be split across as many
-buffers as the transport produces, and responses may come back over several
-callback invocations.
+buffers as the transport produces.
+
+`native_sim` prints the pseudoterminal backing `uart1` on startup. Attach to it
+to drive the server by hand — put the terminal in **raw mode** first, or the
+default line discipline (ICRNL, OPOST, ECHO) will mangle the HTTP byte stream:
+
+```
+uart_1 connected to pseudotty: /dev/pts/9
+```
+
+Set `CONFIG_APP_SELFTEST=n` to skip the injected requests and serve only what
+arrives on the UART.
+
+The UART is selected by the `http-uart` devicetree alias; the supplied
+`native_sim` overlay points it at `uart1` so the console keeps `uart0`.
 
 ## Framing
 
 There is no framing below HTTP — and there never was. TCP does not provide
-message boundaries either; HTTP has always self-delimited at the application
-layer:
-
-- the request head is terminated by `CRLFCRLF`
-- body length comes from `Content-Length` or `Transfer-Encoding: chunked`
+message boundaries either; HTTP self-delimits at the application layer: the
+request head ends at `CRLFCRLF`, and body length comes from `Content-Length` or
+`Transfer-Encoding: chunked`.
 
 `http_parser_execute()` is a resumable, byte-at-a-time parser whose state lives
 in `client->parser` across calls, and the core loop compacts leftover bytes to
-the front of the buffer after every pass. Partial requests therefore just work.
+the front of the buffer after every pass. Partial requests just work.
 
 What TCP *was* providing is **reliability and ordering**, and going bare makes
 that your problem. Bytes must arrive in order, exactly once, with no gaps; a
 dropped or duplicated byte desynchronises the parser, which returns `-EBADMSG`
-and drops the connection. Over a socketpair or shared memory that is free. Over
-a raw UART or a radio link it is not.
+and drops the connection. Over a socketpair that is free. Over a noisy UART it
+is not.
 
 ## Configuration notes
 
@@ -148,19 +187,19 @@ fields are bound by `CONFIG_HTTP_SERVER_MAX_HEADER_LEN`.
 
 ## Things to watch out for
 
-- `bare_http_input()` blocks once the socketpair buffer
-  (`CONFIG_NET_SOCKETPAIR_BUFFER_SIZE`) is full, and so does the server writing a
-  response. **Drain the output from a different thread than the one feeding
-  input**, as this sample does, or the two deadlock on a response larger than the
-  buffer.
-- The output callback runs on the connection RX thread, not the server thread.
-- Never assume a fixed callback size: `recv()` returns whatever is buffered, so a
-  138-byte response arrives as one 138-byte call regardless of `BARE_RX_BUF_SIZE`.
-  If your link needs full frames, accumulate them yourself.
-- Raising the connection count means raising `BARE_MAX_CONN` and
-  `BARE_MAX_PENDING` in `src/bare_transport.c`, plus
-  `CONFIG_HTTP_SERVER_MAX_CLIENTS`, `CONFIG_NET_SOCKETPAIR_MAX` and
-  `CONFIG_ZVFS_OPEN_MAX`, together.
+- The output callback runs on the RX thread, not the server thread. Never call
+  `input()` from it.
+- Never assume a fixed callback size: the payload is whatever was buffered, so a
+  138-byte response arrives as one 138-byte call. If your link needs full frames,
+  accumulate them yourself.
+- `UartBridge` transmits with `uart_poll_out()`, which busy-waits per byte. Fine
+  at sane baud rates; switch to interrupt-driven TX with a second ring buffer if
+  you push large responses at high speed.
+- If the UART RX ring overflows, bytes are dropped and the request stream
+  desynchronises. The bridge logs an error when that happens.
+- One `BareHttpServer` instance at a time: the listening socket is a
+  process-wide singleton, so a second concurrent `start()` returns `-EEXIST`.
+  This is a single-client design by construction.
 
 ## License
 

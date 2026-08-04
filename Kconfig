@@ -1,0 +1,14 @@
+# Copyright (c) 2026 Zephyr Project contributors
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "Bare HTTP server sample"
+
+config APP_SELFTEST
+	bool "Inject canned requests at startup"
+	default y
+	help
+	  Feed a few keep-alive requests into the server at boot, on the same
+	  connection the UART uses. Lets the sample demonstrate that one
+	  connection serves many requests without a terminal attached.
+
+source "Kconfig.zephyr"
