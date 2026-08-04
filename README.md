@@ -12,7 +12,7 @@ listening socket.
 
 ## The API
 
-One standalone class, [`src/bare_http.hpp`](src/bare_http.hpp). The output
+One standalone class, [`src/raw_http.hpp`](src/raw_http.hpp). The output
 callback is registered in the constructor; input is a buffer and a size:
 
 ```cpp
@@ -21,13 +21,13 @@ static void toMyLink(const uint8_t *data, size_t len, void *user)
         my_link_write(data, len);        // bytes out of the server
 }
 
-static BareHttpServer server(toMyLink);
+static RawHttpServer server(toMyLink);
 
 server.start();
 server.input(bytes_from_my_link, n);     // bytes into the server
 ```
 
-That is the whole surface. `BareHttpServer` knows nothing about UARTs —
+That is the whole surface. `RawHttpServer` knows nothing about UARTs —
 [`src/uart_bridge.cpp`](src/uart_bridge.cpp) is a separate class that wires the
 two together, and is easy to swap for a USB endpoint, shared memory, or a test
 harness.
@@ -45,9 +45,12 @@ Two details make that robust:
   server tries to drop an idle client with `shutdown()`, which a socketpair does
   not implement, so over this transport the timeout is a no-op anyway — but the
   code does not rely on that quirk.
-- If the server does hang up — on a malformed request, say — the next `input()`
-  relinks transparently. Any partially delivered request is lost, and the stream
-  resynchronises at the next request boundary.
+- If the server does hang up — on a malformed request, say — a following
+  `input()` relinks. Recovery is **not seamless**: the buffer that races the
+  close is lost, and measurement shows one request goes missing before the
+  relink takes effect; the one after it succeeds. A partially delivered buffer
+  is dropped rather than straddling two connections, which would arrive as
+  garbage on both.
 
 Verified: four requests including a 404, all served over a single connection
 with zero reconnects.
@@ -65,7 +68,7 @@ Everything above that — HTTP/1 parsing, HTTP/2 framing, resource dispatch — 
 purely on `client->buffer` and never touches a descriptor. So the whole job is to
 give the server a descriptor that is not a network socket.
 
-**The listening socket.** `BareHttpServer::socketCreate()` is installed through
+**The listening socket.** `RawHttpServer::socketCreate()` is installed through
 `http_service_config::socket_create`, so the server calls it instead of
 `zsock_socket()`. It returns a descriptor backed by a custom `socket_op_vtable`
 in which `bind()`/`listen()`/`setsockopt()` succeed without doing anything,
@@ -89,14 +92,20 @@ parked on the application's end of the socketpair therefore **locks out `send()`
 on that same descriptor from any other thread** — a hard deadlock the moment one
 connection carries more than one request.
 
-The application end is opened `O_NONBLOCK`, and both directions block in
-`zsock_poll()` instead, which does not hold that mutex while waiting. The
-server's own end stays blocking, which is what its code expects.
+The application end is opened `O_NONBLOCK`, so nothing blocks inside that mutex.
+The RX side then waits in `zsock_poll(POLLIN)`, which does not hold it. The TX
+side deliberately does **not** use `poll(POLLOUT)`: socketpair's POLLOUT
+poll-prepare takes the *peer's* semaphore with `K_FOREVER` while
+`zvfs_poll_internal()` holds the per-fd mutex, so if the server is itself parked
+in a blocking write it deadlocks all three threads. `input()` therefore retries a
+non-blocking `send()` on a short sleep, which gives up with `EAGAIN` instead of
+waiting on that semaphore. The server's own end stays blocking, which is what its
+code expects.
 
 ### Threads
 
 - the HTTP server's own thread, created by the subsystem
-- an RX thread owned by `BareHttpServer`, polling the connection and invoking the
+- an RX thread owned by `RawHttpServer`, polling the connection and invoking the
   output callback
 - a feed thread owned by `UartBridge`, because the UART ISR may not block and
   `input()` may
@@ -197,7 +206,7 @@ fields are bound by `CONFIG_HTTP_SERVER_MAX_HEADER_LEN`.
   you push large responses at high speed.
 - If the UART RX ring overflows, bytes are dropped and the request stream
   desynchronises. The bridge logs an error when that happens.
-- One `BareHttpServer` instance at a time: the listening socket is a
+- One `RawHttpServer` instance at a time: the listening socket is a
   process-wide singleton, so a second concurrent `start()` returns `-EEXIST`.
   This is a single-client design by construction.
 

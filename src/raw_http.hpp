@@ -6,10 +6,10 @@
 
 /**
  * @file
- * @brief Bare (network-less) front end for the Zephyr HTTP server.
+ * @brief Raw (network-less) front end for the Zephyr HTTP server.
  *
  * The HTTP server always talks to its peers through a socket, but it never
- * cares what is behind that socket. BareHttpServer exploits that: it gives the
+ * cares what is behind that socket. RawHttpServer exploits that: it gives the
  * stock, unmodified server a socket that is not a network socket, and exposes
  * the whole thing as two plain operations:
  *
@@ -24,15 +24,15 @@
  *         my_link_write(data, len);
  * }
  *
- * static BareHttpServer server(toMyLink);
+ * static RawHttpServer server(toMyLink);
  *
  * server.start();
  * server.input(bytes_from_my_link, n);
  * @endcode
  */
 
-#ifndef BARE_HTTP_HPP_
-#define BARE_HTTP_HPP_
+#ifndef RAW_HTTP_HPP_
+#define RAW_HTTP_HPP_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -41,7 +41,7 @@
 #include <zephyr/net/http/service.h>
 
 /** Bytes passed to the output callback at most in one go. */
-#define BARE_HTTP_RX_BUF_SIZE 1600
+#define RAW_HTTP_RX_BUF_SIZE 1600
 
 /**
  * @brief The Zephyr HTTP server, driven by bare data buffers.
@@ -49,13 +49,14 @@
  * The connection is persistent. An HTTP/1.1 request that does not carry
  * "Connection: close" leaves it open, so one connection serves requests
  * indefinitely. If the server does hang up - on a malformed request, say -
- * input() re-establishes it transparently on the next call.
+ * input() re-establishes it on a following call; see the note on input() for
+ * what that costs.
  *
  * @note One instance at a time. The listening socket is a process-wide
  *       singleton, so a second concurrent start() fails with -EEXIST. This is
  *       a single-client design by construction.
  */
-class BareHttpServer {
+class RawHttpServer {
 public:
 	/**
 	 * @brief Raw bytes produced by the HTTP server.
@@ -84,15 +85,15 @@ public:
 	 * @param cb Callback receiving the server's output. Must not be nullptr.
 	 * @param user_data Opaque pointer forwarded to @p cb.
 	 */
-	explicit BareHttpServer(OutputCallback cb, void *user_data = nullptr)
+	explicit RawHttpServer(OutputCallback cb, void *user_data = nullptr)
 		: cb_(cb), userData_(user_data)
 	{
 	}
 
-	~BareHttpServer();
+	~RawHttpServer();
 
-	BareHttpServer(const BareHttpServer &) = delete;
-	BareHttpServer &operator=(const BareHttpServer &) = delete;
+	RawHttpServer(const RawHttpServer &) = delete;
+	RawHttpServer &operator=(const RawHttpServer &) = delete;
 
 	/**
 	 * @brief Start the HTTP server and establish the connection.
@@ -108,9 +109,12 @@ public:
 	 * The buffer does not have to hold a whole request, and it may span
 	 * several requests: the server parses a byte stream, not messages.
 	 *
-	 * @note A relink after the server hung up discards any partially
-	 *       delivered request. The stream resynchronises at the next request
-	 *       boundary, so whatever was in flight at that moment is lost.
+	 * @note Recovery is not seamless. The server closes on a malformed
+	 *       request, and the buffer that races that close is lost - measured
+	 *       behaviour is that one request goes missing before the relink
+	 *       takes effect; the one after it succeeds. A buffer that is only
+	 *       partially delivered is dropped rather than straddling two
+	 *       connections, which would arrive as garbage on both.
 	 *
 	 * Blocks until every byte has been handed over, which happens when the
 	 * server is slower than the caller. Never call it from the output
@@ -136,7 +140,7 @@ public:
 	 *
 	 * @code
 	 * static const struct http_service_config cfg = {
-	 *         .socket_create = BareHttpServer::socketCreate,
+	 *         .socket_create = RawHttpServer::socketCreate,
 	 * };
 	 * @endcode
 	 */
@@ -153,10 +157,10 @@ private:
 	struct k_mutex lock_ {};
 	struct k_thread thread_ {};
 	bool started_{false};
-	bool linked_{false};
+	volatile bool linked_{false};
 	bool threadStarted_{false};
 	volatile bool running_{false};
-	uint8_t rxBuf_[BARE_HTTP_RX_BUF_SIZE]{};
+	uint8_t rxBuf_[RAW_HTTP_RX_BUF_SIZE]{};
 };
 
-#endif /* BARE_HTTP_HPP_ */
+#endif /* RAW_HTTP_HPP_ */

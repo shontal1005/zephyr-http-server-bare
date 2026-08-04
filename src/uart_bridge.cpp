@@ -15,7 +15,7 @@
 LOG_MODULE_REGISTER(uart_bridge, LOG_LEVEL_INF);
 
 #define UART_FEED_CHUNK    64
-#define UART_FEED_STACK    1536
+#define UART_FEED_STACK    2048
 #define UART_FEED_PRIORITY K_PRIO_PREEMPT(9)
 
 K_THREAD_STACK_DEFINE(uart_feed_stack, UART_FEED_STACK);
@@ -58,7 +58,7 @@ void UartBridge::isr(const struct device *dev)
 		return;
 	}
 
-	/* The ISR only moves bytes into the ring: BareHttpServer::input() may
+	/* The ISR only moves bytes into the ring: RawHttpServer::input() may
 	 * block when the server is slow, which must never happen here.
 	 */
 	while (uart_irq_rx_ready(dev)) {

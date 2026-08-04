@@ -8,7 +8,7 @@ project(http_server_bare CXX)
 
 target_sources(app PRIVATE
   src/main.cpp
-  src/bare_http.cpp
+  src/raw_http.cpp
   src/uart_bridge.cpp
 )
 

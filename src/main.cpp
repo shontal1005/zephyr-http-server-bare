@@ -26,7 +26,7 @@
 #include <zephyr/net/http/server.h>
 #include <zephyr/net/http/service.h>
 
-#include "bare_http.hpp"
+#include "raw_http.hpp"
 #include "uart_bridge.hpp"
 
 LOG_MODULE_REGISTER(net_http_server_bare, LOG_LEVEL_INF);
@@ -40,7 +40,7 @@ LOG_MODULE_REGISTER(net_http_server_bare, LOG_LEVEL_INF);
 static uint16_t bare_port = 80;
 
 static const struct http_service_config bare_config = {
-	.socket_create = BareHttpServer::socketCreate,
+	.socket_create = RawHttpServer::socketCreate,
 };
 
 HTTP_SERVICE_DEFINE(bare_service, nullptr, &bare_port, 1, 1, nullptr, nullptr, &bare_config);
@@ -118,7 +118,7 @@ static const char *const selftest_requests[] = {
 	"GET /uptime HTTP/1.1\r\nHost: bare\r\n\r\n",
 };
 
-static void run_selftest(BareHttpServer &server)
+static void run_selftest(RawHttpServer &server)
 {
 	ARRAY_FOR_EACH(selftest_requests, i) {
 		const char *request = selftest_requests[i];

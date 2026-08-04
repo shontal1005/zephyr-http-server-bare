@@ -15,7 +15,7 @@ raw bytes straight off a UART.
 There is no L2 driver, no IP and no TCP in the image. The only file descriptors
 in play are a :c:func:`socketpair` and a small custom listening socket.
 
-The application-facing surface is a single C++ class, ``BareHttpServer``:
+The application-facing surface is a single C++ class, ``RawHttpServer``:
 
 .. code-block:: cpp
 
@@ -24,13 +24,13 @@ The application-facing surface is a single C++ class, ``BareHttpServer``:
            my_link_write(data, len);        /* bytes out of the server */
    }
 
-   static BareHttpServer server(toMyLink);
+   static RawHttpServer server(toMyLink);
 
    server.start();
    server.input(bytes_from_my_link, n);     /* bytes into the server */
 
 The output callback is registered through the constructor and ``input()`` takes
-a buffer and a size. That is the whole API; ``BareHttpServer`` knows nothing
+a buffer and a size. That is the whole API; ``RawHttpServer`` knows nothing
 about UARTs. :file:`src/uart_bridge.cpp` is a separate class that connects the
 two, and is easy to replace with a USB endpoint, shared memory or a test
 harness.
@@ -49,10 +49,12 @@ Two details make that robust:
   The server tries to drop an idle client with ``shutdown()``, which a
   socketpair does not implement, so over this transport the timeout is a no-op
   anyway - but the sample does not rely on that quirk.
-* If the server does hang up - on a malformed request, for instance - the next
-  ``input()`` re-establishes the connection transparently. Any partially
-  delivered request is lost, and the stream resynchronises at the next request
-  boundary.
+* If the server does hang up - on a malformed request, for instance - a
+  following ``input()`` re-establishes the connection. Recovery is not seamless:
+  the buffer that races the close is lost, and measurement shows one request
+  goes missing before the relink takes effect. The request after it succeeds. A
+  partially delivered buffer is dropped rather than straddling two connections,
+  which would arrive as garbage on both.
 
 How it works
 ************
@@ -69,7 +71,7 @@ Everything above that - HTTP/1 parsing, HTTP/2 framing, resource dispatch - runs
 purely on ``client->buffer`` and never touches a descriptor. So the whole job is
 to give the server a descriptor that is not a network socket.
 
-**The listening socket.** ``BareHttpServer::socketCreate()`` is installed
+**The listening socket.** ``RawHttpServer::socketCreate()`` is installed
 through :c:member:`http_service_config.socket_create`, so the server calls it
 instead of :c:func:`zsock_socket`. It returns a descriptor backed by a custom
 ``socket_op_vtable`` in which ``bind()`` and ``listen()`` succeed without doing
@@ -94,15 +96,22 @@ call (``VTABLE_CALL`` in :file:`subsys/net/lib/sockets/sockets.c`). A blocking
 ``send()`` on that same descriptor from any other thread - a hard deadlock the
 moment one connection carries more than one request.
 
-The application end is consequently opened ``O_NONBLOCK``, and both directions
-block in :c:func:`zsock_poll` instead, which does not hold that mutex while
-waiting. The server's own end stays blocking, which is what its code expects.
+The application end is consequently opened ``O_NONBLOCK``, so nothing blocks
+inside that mutex. The RX side then waits in :c:func:`zsock_poll` with
+``POLLIN``, which does not hold it. The TX side deliberately does **not** use
+``POLLOUT``: socketpair's POLLOUT poll-prepare takes the *peer's* semaphore with
+``K_FOREVER`` while ``zvfs_poll_internal()`` holds the per-fd mutex, so if the
+server is itself parked in a blocking write, all three threads deadlock.
+``input()`` therefore retries a non-blocking ``send()`` on a short sleep, which
+gives up with ``EAGAIN`` instead of waiting on that semaphore.
+
+The server's own end stays blocking, which is what its code expects.
 
 Threads
 =======
 
 * the HTTP server's own thread, created by the subsystem;
-* an RX thread owned by ``BareHttpServer``, which polls the connection and
+* an RX thread owned by ``RawHttpServer``, which polls the connection and
   invokes the output callback;
 * a feed thread owned by ``UartBridge``, because the UART ISR may not block and
   ``input()`` may.

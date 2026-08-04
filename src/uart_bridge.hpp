@@ -6,12 +6,12 @@
 
 /**
  * @file
- * @brief Wire a UART straight into a BareHttpServer.
+ * @brief Wire a UART straight into a RawHttpServer.
  *
  * Bytes received on the UART become HTTP requests, and the HTTP responses go
  * back out of the same UART. Nothing sits in between.
  *
- * BareHttpServer knows nothing about this class: it only ever sees buffers.
+ * RawHttpServer knows nothing about this class: it only ever sees buffers.
  */
 
 #ifndef UART_BRIDGE_HPP_
@@ -21,7 +21,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/ring_buffer.h>
 
-#include "bare_http.hpp"
+#include "raw_http.hpp"
 
 /** Bytes buffered between the UART ISR and the feed thread. */
 #define UART_BRIDGE_RING_SIZE 1024
@@ -43,13 +43,13 @@ public:
 	int start();
 
 	/** @brief The underlying server, for injecting requests directly. */
-	BareHttpServer &server()
+	RawHttpServer &server()
 	{
 		return server_;
 	}
 
 private:
-	/* Server -> UART. Static, to match BareHttpServer::OutputCallback. */
+	/* Server -> UART. Static, to match RawHttpServer::OutputCallback. */
 	static void onServerOutput(const uint8_t *data, size_t len, void *user_data);
 	void writeToUart(const uint8_t *data, size_t len);
 
@@ -60,7 +60,7 @@ private:
 	void feedLoop();
 
 	const struct device *uart_;
-	BareHttpServer server_{onServerOutput, this};
+	RawHttpServer server_{onServerOutput, this};
 	struct ring_buf rxRing_ {};
 	uint8_t rxRingBuf_[UART_BRIDGE_RING_SIZE]{};
 	struct k_sem rxSem_ {};

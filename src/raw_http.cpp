@@ -13,20 +13,27 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/sys/fdtable.h>
 
-#include "bare_http.hpp"
+#include "raw_http.hpp"
 
-LOG_MODULE_REGISTER(bare_http, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(raw_http, LOG_LEVEL_INF);
 
-#define BARE_MAX_PENDING   2
-#define BARE_RX_STACK_SIZE 1024
-#define BARE_RX_PRIORITY   K_PRIO_PREEMPT(8)
+#define RAW_MAX_PENDING   2
+/* zvfs_poll_internal() puts a k_poll_event[CONFIG_ZVFS_POLL_MAX] on the
+ * caller's stack, so anything that calls poll() needs real headroom.
+ */
+#define RAW_RX_STACK_SIZE 2048
+#define RAW_RX_PRIORITY   K_PRIO_PREEMPT(8)
+
+/* Retry cadence and overall give-up bound for a blocked input(). */
+#define RAW_TX_RETRY_MS   2
+#define RAW_TX_TIMEOUT_MS 5000
 
 /* How long poll() parks before rechecking running_. Bounds how long stop()
  * takes; an idle link costs one wakeup per interval and nothing else.
  */
-#define BARE_POLL_TIMEOUT_MS 500
+#define RAW_POLL_TIMEOUT_MS 500
 
-K_THREAD_STACK_DEFINE(bare_rx_stack, BARE_RX_STACK_SIZE);
+K_THREAD_STACK_DEFINE(raw_rx_stack, RAW_RX_STACK_SIZE);
 
 namespace
 {
@@ -37,7 +44,7 @@ namespace
  * The HTTP server only ever does four things with it: setsockopt(), bind(),
  * listen(), then poll()+accept() in a loop. bind() and listen() are no-ops
  * here, poll() is backed by a k_poll_signal, and accept() pops a socketpair end
- * that BareHttpServer::link() queued.
+ * that RawHttpServer::link() queued.
  *
  * It is deliberately a singleton: HTTP_SERVICE_DEFINE() registers exactly one
  * service, and this sample serves exactly one client.
@@ -45,7 +52,7 @@ namespace
 struct Listener {
 	struct k_poll_signal acceptSig;
 	struct k_spinlock lock;
-	int pending[BARE_MAX_PENDING];
+	int pending[RAW_MAX_PENDING];
 	uint8_t pendingCount;
 	bool inUse;
 };
@@ -73,12 +80,16 @@ ssize_t listenerWrite(void *obj, const void *buf, size_t sz)
 	return -1;
 }
 
-int listenerClose(void *obj)
+/* Registered as close2(): zvfs_close() calls that union member, not close(),
+ * whenever the descriptor was finalised with ZVFS_MODE_IFSOCK.
+ */
+int listenerClose(void *obj, int fd)
 {
-	int fds[BARE_MAX_PENDING];
+	int fds[RAW_MAX_PENDING];
 	uint8_t count;
 
 	ARG_UNUSED(obj);
+	ARG_UNUSED(fd);
 
 	k_spinlock_key_t key = k_spin_lock(&listener.lock);
 
@@ -105,8 +116,10 @@ int listenerPollPrepare(struct zsock_pollfd *pfd, struct k_poll_event **pev,
 	}
 
 	if (*pev == pev_end) {
-		errno = ENOMEM;
-		return -1;
+		/* zvfs_poll_internal() does errno = -result, so these ioctls
+		 * must return a negative errno rather than -1.
+		 */
+		return -ENOMEM;
 	}
 
 	/* Clear a stale signal before blocking. Anything queued after this
@@ -170,8 +183,7 @@ int listenerIoctl(void *obj, unsigned int request, va_list args)
 	}
 
 	default:
-		errno = EOPNOTSUPP;
-		return -1;
+		return -EOPNOTSUPP;
 	}
 }
 
@@ -265,7 +277,7 @@ void initListenerVtable()
 {
 	listenerVtable.fd_vtable.read = listenerRead;
 	listenerVtable.fd_vtable.write = listenerWrite;
-	listenerVtable.fd_vtable.close = listenerClose;
+	listenerVtable.fd_vtable.close2 = listenerClose;
 	listenerVtable.fd_vtable.ioctl = listenerIoctl;
 	listenerVtable.bind = listenerBind;
 	listenerVtable.listen = listenerListen;
@@ -299,12 +311,33 @@ int listenerPush(int fd)
 	return 0;
 }
 
+/* Close anything queued but never accepted, so a teardown before the server
+ * got round to accept() does not strand a descriptor in the listener.
+ */
+void listenerDrainPending()
+{
+	int fds[RAW_MAX_PENDING];
+	uint8_t count;
+
+	k_spinlock_key_t key = k_spin_lock(&listener.lock);
+
+	count = listener.pendingCount;
+	memcpy(fds, listener.pending, count * sizeof(fds[0]));
+	listener.pendingCount = 0;
+
+	k_spin_unlock(&listener.lock, key);
+
+	for (uint8_t i = 0; i < count; i++) {
+		(void)zsock_close(fds[i]);
+	}
+}
+
 /* The running instance, so the RX thread trampoline can find it. */
-BareHttpServer *instance;
+RawHttpServer *instance;
 
 } /* namespace */
 
-int BareHttpServer::socketCreate(const struct http_service_desc *svc, int af, int proto)
+int RawHttpServer::socketCreate(const struct http_service_desc *svc, int af, int proto)
 {
 	int fd;
 
@@ -327,20 +360,20 @@ int BareHttpServer::socketCreate(const struct http_service_desc *svc, int af, in
 			       reinterpret_cast<const struct fd_op_vtable *>(&listenerVtable),
 			       ZVFS_MODE_IFSOCK);
 
-	LOG_DBG("Bare listening socket created (fd %d)", fd);
+	LOG_DBG("Raw listening socket created (fd %d)", fd);
 
 	return fd;
 }
 
-void BareHttpServer::rxTrampoline(void *p1, void *p2, void *p3)
+void RawHttpServer::rxTrampoline(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	static_cast<BareHttpServer *>(p1)->rxLoop();
+	static_cast<RawHttpServer *>(p1)->rxLoop();
 }
 
-void BareHttpServer::rxLoop()
+void RawHttpServer::rxLoop()
 {
 	bool eof = false;
 
@@ -354,9 +387,12 @@ void BareHttpServer::rxLoop()
 		/* The timeout is what lets stop() retire this thread; the fd
 		 * must stay open while we are parked in poll().
 		 */
-		int ret = zsock_poll(&pfd, 1, BARE_POLL_TIMEOUT_MS);
+		int ret = zsock_poll(&pfd, 1, RAW_POLL_TIMEOUT_MS);
 
 		if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
 			LOG_DBG("poll failed (%d)", -errno);
 			break;
 		}
@@ -399,7 +435,7 @@ void BareHttpServer::rxLoop()
 }
 
 /* Caller must hold lock_. */
-int BareHttpServer::link()
+int RawHttpServer::link()
 {
 	int sv[2];
 	int ret;
@@ -408,8 +444,18 @@ int BareHttpServer::link()
 	 * before its stack is handed to a new one.
 	 */
 	if (threadStarted_) {
+		running_ = false;
 		(void)k_thread_join(&thread_, K_FOREVER);
 		threadStarted_ = false;
+	}
+
+	/* Release the previous descriptor before allocating a new pair. Without
+	 * this a relink leaks both the fd and its 2 KiB spair block, and with a
+	 * tight CONFIG_NET_SOCKETPAIR_MAX the very first relink fails outright.
+	 */
+	if (appFd_ >= 0) {
+		(void)zsock_close(appFd_);
+		appFd_ = -1;
 	}
 
 	ret = zsock_socketpair(NET_AF_UNIX, NET_SOCK_STREAM, 0, sv);
@@ -447,15 +493,15 @@ int BareHttpServer::link()
 	linked_ = true;
 	running_ = true;
 
-	k_thread_create(&thread_, bare_rx_stack, K_THREAD_STACK_SIZEOF(bare_rx_stack),
-			rxTrampoline, this, nullptr, nullptr, BARE_RX_PRIORITY, 0, K_NO_WAIT);
-	(void)k_thread_name_set(&thread_, "bare_rx");
+	k_thread_create(&thread_, raw_rx_stack, K_THREAD_STACK_SIZEOF(raw_rx_stack),
+			rxTrampoline, this, nullptr, nullptr, RAW_RX_PRIORITY, 0, K_NO_WAIT);
+	(void)k_thread_name_set(&thread_, "raw_rx");
 	threadStarted_ = true;
 
 	return 0;
 }
 
-int BareHttpServer::start()
+int RawHttpServer::start()
 {
 	int ret;
 
@@ -468,12 +514,12 @@ int BareHttpServer::start()
 	}
 
 	if (instance != nullptr) {
-		LOG_ERR("Another BareHttpServer is already running");
+		LOG_ERR("Another RawHttpServer is already running");
 		return -EEXIST;
 	}
 
 	ret = http_server_start();
-	if (ret < 0) {
+	if (ret < 0 && ret != -EALREADY) {
 		LOG_ERR("Cannot start the HTTP server (%d)", ret);
 		return ret;
 	}
@@ -501,16 +547,23 @@ int BareHttpServer::start()
 	return 0;
 }
 
-int BareHttpServer::input(const void *buffer, size_t size)
+int RawHttpServer::input(const void *buffer, size_t size)
 {
 	const uint8_t *ptr = static_cast<const uint8_t *>(buffer);
+	k_timepoint_t deadline = sys_timepoint_calc(K_MSEC(RAW_TX_TIMEOUT_MS));
+	bool retried = false;
 	int ret = 0;
 
+	k_mutex_lock(&lock_, K_FOREVER);
+
+	/* Checked under the lock: otherwise a concurrent stop() could complete
+	 * between the test and the relink below, leaving a running RX thread
+	 * and two descriptors that no later stop() would ever reclaim.
+	 */
 	if (!started_) {
+		k_mutex_unlock(&lock_);
 		return -ENOTCONN;
 	}
-
-	k_mutex_lock(&lock_, K_FOREVER);
 
 	/* The server hangs up on a malformed request, and on its inactivity
 	 * timeout where the transport supports shutdown(). Relink so the link
@@ -534,30 +587,61 @@ int BareHttpServer::input(const void *buffer, size_t size)
 			continue;
 		}
 
+		if (sent < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+			/*
+			 * The server hung up but the RX thread has not noticed
+			 * yet, so linked_ was still set when we started. Relink
+			 * and deliver this buffer again - but only if none of
+			 * it went out, otherwise the request would straddle two
+			 * connections and arrive as garbage on both.
+			 */
+			if (retried || ptr != static_cast<const uint8_t *>(buffer)) {
+				ret = -errno;
+				goto out;
+			}
+
+			retried = true;
+			linked_ = false;
+			LOG_INF("Peer hung up mid-send, reconnecting");
+
+			ret = link();
+			if (ret < 0) {
+				goto out;
+			}
+
+			continue;
+		}
+
 		if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 			ret = -errno;
 			goto out;
 		}
 
-		/* The server has not drained its side yet. Wait for room here
-		 * rather than inside the socket call, so the RX thread can keep
-		 * draining responses meanwhile.
+		/*
+		 * The server has not drained its side yet. Retry after a short
+		 * sleep.
+		 *
+		 * Deliberately NOT poll(POLLOUT): socketpair's POLLOUT
+		 * poll-prepare takes the peer's semaphore with K_FOREVER
+		 * (zsock_poll_prepare_ctx() in subsys/net/lib/sockets/
+		 * socketpair.c) while zvfs_poll_internal() holds this
+		 * descriptor's per-fd mutex. If the server is itself parked in a
+		 * blocking write - which keeps that same peer semaphore - the RX
+		 * thread can no longer take the per-fd mutex to drain us, and
+		 * all three deadlock. A non-blocking send() cannot: it gives up
+		 * with EAGAIN rather than waiting on the peer semaphore.
 		 */
-		struct zsock_pollfd pfd = {
-			.fd = appFd_,
-			.events = ZSOCK_POLLOUT,
-			.revents = 0,
-		};
-
-		if (zsock_poll(&pfd, 1, BARE_POLL_TIMEOUT_MS) < 0) {
-			ret = -errno;
-			goto out;
-		}
-
-		if (pfd.revents & (ZSOCK_POLLERR | ZSOCK_POLLHUP)) {
+		if (!running_) {
 			ret = -ECONNRESET;
 			goto out;
 		}
+
+		if (sys_timepoint_expired(deadline)) {
+			ret = -ETIMEDOUT;
+			goto out;
+		}
+
+		k_sleep(K_MSEC(RAW_TX_RETRY_MS));
 	}
 
 out:
@@ -566,7 +650,7 @@ out:
 	return ret;
 }
 
-void BareHttpServer::stop()
+void RawHttpServer::stop()
 {
 	if (!started_) {
 		return;
@@ -588,15 +672,19 @@ void BareHttpServer::stop()
 		threadStarted_ = false;
 	}
 
-	(void)zsock_close(appFd_);
-	appFd_ = -1;
+	if (appFd_ >= 0) {
+		(void)zsock_close(appFd_);
+		appFd_ = -1;
+	}
+
+	listenerDrainPending();
 
 	instance = nullptr;
 
 	k_mutex_unlock(&lock_);
 }
 
-BareHttpServer::~BareHttpServer()
+RawHttpServer::~RawHttpServer()
 {
 	stop();
 }
