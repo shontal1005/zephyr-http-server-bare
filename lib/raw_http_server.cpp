@@ -204,10 +204,15 @@ int RawHttpServer::on_message_complete(struct http_parser *parser)
 	 * request, in order, even when several share an input() buffer.
 	 */
 	if (self->_error_status != 0) {
+		/* The request failed somewhere along the way. */
 		self->respond(self->_error_status, 0);
 	} else if (parser->method == HTTP_GET) {
+		/* A download: open the file and stream it back. */
 		self->send_file();
 	} else {
+		/* An upload (PUT or POST - anything else already failed with
+		 * 405): the whole body is on disk, close and confirm.
+		 */
 		(void)fs_close(&self->_file);
 		self->_file_open = false;
 		self->respond(201, 0);
