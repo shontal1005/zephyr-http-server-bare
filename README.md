@@ -208,6 +208,14 @@ with SerialRawHttpClient("/dev/pts/9") as client:
 The file doubles as a tool:
 `./client/raw_http_client.py /dev/ttyUSB0 download report.bin report.bin`.
 
+A pytest suite drives the client end to end — against an auto-launched
+`native_sim` by default, or against a real board over plain UART:
+
+```sh
+pytest tests/                                  # launches build/zephyr/zephyr.exe
+pytest tests/ --device /dev/ttyUSB0 --baud 115200   # a real board
+```
+
 ## Configuration notes
 
 `RAW_HTTP_SERVER` **selects** `NETWORKING` for one reason only: the parser
