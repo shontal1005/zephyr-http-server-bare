@@ -10,6 +10,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/http/parser.h>
+#include <zephyr/net/http/status.h>
 #include <zephyr/sys/printk.h>
 
 #include "raw_http_server.hpp"
@@ -28,19 +29,21 @@ constexpr size_t response_head_max = 96;
 const char *reason_of(unsigned int status)
 {
 	switch (status) {
-	case 200:
+	case HTTP_200_OK:
 		return "OK";
-	case 201:
+	case HTTP_201_CREATED:
 		return "Created";
-	case 400:
+	case HTTP_400_BAD_REQUEST:
 		return "Bad Request";
-	case 404:
+	case HTTP_404_NOT_FOUND:
 		return "Not Found";
-	case 405:
+	case HTTP_405_METHOD_NOT_ALLOWED:
 		return "Method Not Allowed";
-	case 414:
+	case HTTP_414_URI_TOO_LONG:
 		return "URI Too Long";
+	case HTTP_500_INTERNAL_SERVER_ERROR:
 	default:
+		// Also the safety net for a status this switch does not know.
 		return "Internal Server Error";
 	}
 }
@@ -85,7 +88,7 @@ int RawHttpServer::input(const void *buffer, size_t size)
 		LOG_WRN("Malformed request dropped (%s)",
 			http_errno_name(HTTP_PARSER_ERRNO(&_parser)));
 
-		respond(400, 0);
+		respond(HTTP_400_BAD_REQUEST, 0);
 		reset_request();
 		http_parser_init(&_parser, HTTP_REQUEST);
 	}
@@ -102,7 +105,7 @@ int RawHttpServer::on_url(struct http_parser *parser, const char *at, size_t len
 	// The URL arrives in fragments. Poison an oversized one rather than
 	// truncating, which would silently address the wrong file.
 	if (self->_url_len + length >= sizeof(self->_url)) {
-		self->_error_status = 414;
+		self->_error_status = HTTP_414_URI_TOO_LONG;
 		return 0;
 	}
 
@@ -134,7 +137,7 @@ int RawHttpServer::on_headers_complete(struct http_parser *parser)
 		int ret = self->build_path(path, sizeof(path));
 
 		if (ret < 0) {
-			self->_error_status = 404;
+			self->_error_status = HTTP_404_NOT_FOUND;
 			return 0;
 		}
 
@@ -144,7 +147,7 @@ int RawHttpServer::on_headers_complete(struct http_parser *parser)
 
 		if (ret < 0) {
 			LOG_ERR("Cannot open %s for upload (%d)", path, ret);
-			self->_error_status = 500;
+			self->_error_status = HTTP_500_INTERNAL_SERVER_ERROR;
 			return 0;
 		}
 
@@ -154,7 +157,7 @@ int RawHttpServer::on_headers_complete(struct http_parser *parser)
 	}
 
 	default:
-		self->_error_status = 405;
+		self->_error_status = HTTP_405_METHOD_NOT_ALLOWED;
 		return 0;
 	}
 }
@@ -176,7 +179,7 @@ int RawHttpServer::on_body(struct http_parser *parser, const char *at, size_t le
 		LOG_ERR("fs_write failed (%d)", (int)written);
 		(void)fs_close(&self->_file);
 		self->_file_open = false;
-		self->_error_status = 500;
+		self->_error_status = HTTP_500_INTERNAL_SERVER_ERROR;
 	}
 
 	return 0;
@@ -196,11 +199,11 @@ int RawHttpServer::on_message_complete(struct http_parser *parser)
 		// An upload: the whole body is on disk, close and confirm.
 		(void)fs_close(&self->_file);
 		self->_file_open = false;
-		self->respond(201, 0);
+		self->respond(HTTP_201_CREATED, 0);
 	} else {
 		// Unreachable: on_headers_complete() already failed every
 		// other method with 405. Answer something sane just in case.
-		self->respond(500, 0);
+		self->respond(HTTP_500_INTERNAL_SERVER_ERROR, 0);
 	}
 
 	self->reset_request();
@@ -257,13 +260,13 @@ void RawHttpServer::send_file()
 
 	if (ret < 0) {
 		LOG_INF("GET %s -> %d", _url, ret);
-		respond(404, 0);
+		respond(HTTP_404_NOT_FOUND, 0);
 		return;
 	}
 
 	LOG_INF("GET %s", path);
 	_file_open = true;
-	respond(200, entry.size);
+	respond(HTTP_200_OK, entry.size);
 
 	for (;;) {
 		ssize_t got = fs_read(&_file, _file_buf, sizeof(_file_buf));
