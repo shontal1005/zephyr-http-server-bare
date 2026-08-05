@@ -37,11 +37,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <zephyr/fs/fs.h>
 #include <zephyr/kernel.h>
+#include <zephyr/net/http/server.h>
 #include <zephyr/net/http/service.h>
 
 /** Bytes passed to the output callback at most in one go. */
 #define RAW_HTTP_RX_BUF_SIZE 1600
+
+/** URL prefix under which files are served. Register the resource with it. */
+#define RAW_HTTP_FILES_PREFIX "/files/"
+
+/** Bytes moved to or from the filesystem per callback. */
+#define RAW_HTTP_FILE_CHUNK 512
+
+/** Longest absolute path this server will build. */
+#define RAW_HTTP_PATH_MAX 128
 
 /**
  * @brief The Zephyr HTTP server, driven by bare data buffers.
@@ -85,8 +96,14 @@ public:
 	 * @param cb Callback receiving the server's output. Must not be nullptr.
 	 * @param user_data Opaque pointer forwarded to @p cb.
 	 */
-	explicit RawHttpServer(OutputCallback cb, void *user_data = nullptr)
-		: cb_(cb), userData_(user_data)
+	/**
+	 * @param cb Callback receiving the server's output. Must not be nullptr.
+	 * @param fs_root Already-mounted directory that files are served from and
+	 *                uploaded into, e.g. "/lfs". Not created or mounted here.
+	 * @param user_data Opaque pointer forwarded to @p cb.
+	 */
+	explicit RawHttpServer(OutputCallback cb, const char *fs_root, void *user_data = nullptr)
+		: cb_(cb), userData_(user_data), fsRoot_(fs_root)
 	{
 	}
 
@@ -146,13 +163,60 @@ public:
 	 */
 	static int socketCreate(const struct http_service_desc *svc, int af, int proto);
 
+	/**
+	 * @brief Resource callback serving files out of, and into, the fs root.
+	 *
+	 * GET streams a file back; PUT and POST write the request body to one.
+	 * Register it on RAW_HTTP_FILES_PREFIX "*" with this instance as the
+	 * resource's user_data:
+	 *
+	 * @code
+	 * static struct http_resource_detail_dynamic files = {
+	 *         .common = { .bitmask_of_supported_http_methods =
+	 *                             BIT(HTTP_GET) | BIT(HTTP_PUT) | BIT(HTTP_POST),
+	 *                     .type = HTTP_RESOURCE_TYPE_DYNAMIC, ... },
+	 *         .cb = RawHttpServer::fileHandler,
+	 * };
+	 * files.user_data = &server;      // at runtime, before start()
+	 * @endcode
+	 *
+	 * @note Responses are chunked: a dynamic resource has no Content-Length.
+	 * @note One transfer at a time, which the server's per-resource holder
+	 *       already enforces for a single client.
+	 */
+	static int fileHandler(struct http_client_ctx *client, enum http_transaction_status status,
+			       const struct http_request_ctx *request_ctx,
+			       struct http_response_ctx *response_ctx, void *user_data);
+
+	/** @brief The filesystem root passed to the constructor. */
+	const char *fsRoot() const
+	{
+		return fsRoot_;
+	}
+
 private:
 	int link();
 	static void rxTrampoline(void *p1, void *p2, void *p3);
 	void rxLoop();
 
+	int handleFile(struct http_client_ctx *client, enum http_transaction_status status,
+		       const struct http_request_ctx *request_ctx,
+		       struct http_response_ctx *response_ctx);
+	int handleDownload(struct http_client_ctx *client, struct http_response_ctx *response_ctx);
+	int handleUpload(struct http_client_ctx *client, enum http_transaction_status status,
+			 const struct http_request_ctx *request_ctx,
+			 struct http_response_ctx *response_ctx);
+	int buildPath(const char *url, char *out, size_t out_size);
+	void closeTransfer();
+
 	OutputCallback cb_;
 	void *userData_;
+	const char *fsRoot_;
+
+	/* In-flight file transfer. Single-client by design, so one is enough. */
+	struct fs_file_t file_ {};
+	bool fileOpen_{false};
+	uint8_t fileBuf_[RAW_HTTP_FILE_CHUNK]{};
 	int appFd_{-1};
 	struct k_mutex lock_ {};
 	struct k_thread thread_ {};

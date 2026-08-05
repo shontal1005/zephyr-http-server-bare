@@ -1,6 +1,6 @@
 sample:
-  description: Drive the HTTP server over a UART with bare data buffers, without a
-    network stack
+  description: Download and upload files over a UART with bare data buffers, without
+    a network stack
   name: http_server_bare_sample
 common:
   harness: console
@@ -11,10 +11,12 @@ common:
       - "UART .* wired to the HTTP server"
       - "request 1: feeding .* bytes in two chunks"
       - "connection still up: yes"
-      - "request 2: feeding .* bytes in two chunks"
-      - "connection still up: yes"
       - "request 3: feeding .* bytes in two chunks"
-      - "connection still up: yes"
+      - "GET /lfs/hello.txt"
+      - "request 4: feeding .* bytes in two chunks"
+      - "PUT /lfs/upload.txt"
+      - "request 5: feeding .* bytes in two chunks"
+      - "GET /lfs/upload.txt"
       - "Self-test done"
   tags:
     - http
@@ -22,6 +24,7 @@ common:
     - server
     - socket
     - uart
+    - filesystem
   integration_platforms:
     - native_sim
 tests:

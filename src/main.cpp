@@ -21,7 +21,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <zephyr/fs/fs.h>
+#include <zephyr/fs/littlefs.h>
 #include <zephyr/kernel.h>
+#include <zephyr/storage/flash_map.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/http/server.h>
 #include <zephyr/net/http/service.h>
@@ -101,10 +104,65 @@ static struct http_resource_detail_dynamic uptime_resource_detail = {
 
 HTTP_RESOURCE_DEFINE(uptime_resource, bare_service, "/uptime", &uptime_resource_detail);
 
+/*
+ * Files are served from an already-mounted directory. A real board typically
+ * mounts its storage during boot and simply hands the path to the server; this
+ * sample mounts a littlefs on native_sim so it has something to serve.
+ */
+#define FILES_MOUNT_POINT "/lfs"
+
+FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(storage);
+static struct fs_mount_t files_mount = {
+	.type = FS_LITTLEFS,
+	.mnt_point = FILES_MOUNT_POINT,
+	.fs_data = &storage,
+	.storage_dev = (void *)PARTITION_ID(storage_partition),
+};
+
+/* A file to download, so the sample has something to serve out of the box. */
+static int seed_demo_file(void)
+{
+	static const char body[] = "hello from the bare HTTP server\n";
+	struct fs_file_t file;
+	int ret;
+
+	fs_file_t_init(&file);
+
+	ret = fs_open(&file, FILES_MOUNT_POINT "/hello.txt", FS_O_CREATE | FS_O_WRITE);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = fs_write(&file, body, sizeof(body) - 1);
+	(void)fs_close(&file);
+
+	return ret < 0 ? ret : 0;
+}
+
 /* The UART carrying HTTP. Constructing it does no work, so namespace scope is
  * safe; everything happens in start().
  */
-static UartBridge bridge(DEVICE_DT_GET(DT_ALIAS(http_uart)));
+static UartBridge bridge(DEVICE_DT_GET(DT_ALIAS(http_uart)), FILES_MOUNT_POINT);
+
+/* GET downloads a file, PUT/POST uploads one. user_data is filled in at
+ * runtime because it points at an object, not a constant.
+ */
+static struct http_resource_detail_dynamic files_resource_detail = {
+	.common = {
+		.bitmask_of_supported_http_methods =
+			BIT(HTTP_GET) | BIT(HTTP_PUT) | BIT(HTTP_POST),
+		.type = HTTP_RESOURCE_TYPE_DYNAMIC,
+		.path_len = 0,
+		.content_encoding = nullptr,
+		.content_type = "application/octet-stream",
+	},
+	.cb = RawHttpServer::fileHandler,
+	.holder = nullptr,
+	.user_data = nullptr,
+};
+
+HTTP_RESOURCE_DEFINE(files_resource, bare_service, RAW_HTTP_FILES_PREFIX "*",
+		     &files_resource_detail);
 
 #if defined(CONFIG_APP_SELFTEST)
 /*
@@ -115,7 +173,13 @@ static UartBridge bridge(DEVICE_DT_GET(DT_ALIAS(http_uart)));
 static const char *const selftest_requests[] = {
 	"GET / HTTP/1.1\r\nHost: bare\r\n\r\n",
 	"GET /uptime HTTP/1.1\r\nHost: bare\r\n\r\n",
-	"GET /uptime HTTP/1.1\r\nHost: bare\r\n\r\n",
+	/* download the seeded file */
+	"GET " RAW_HTTP_FILES_PREFIX "hello.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+	/* upload a new one ... */
+	"PUT " RAW_HTTP_FILES_PREFIX "upload.txt HTTP/1.1\r\nHost: bare\r\n"
+	"Content-Length: 21\r\n\r\nuploaded over a UART\n",
+	/* ... and read it back */
+	"GET " RAW_HTTP_FILES_PREFIX "upload.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
 };
 
 static void run_selftest(RawHttpServer &server)
@@ -151,6 +215,24 @@ static void run_selftest(RawHttpServer &server)
 int main(void)
 {
 	int ret;
+
+	/* A real board would have done this during boot; the server only ever
+	 * receives the resulting path.
+	 */
+	ret = fs_mount(&files_mount);
+	if (ret < 0) {
+		LOG_ERR("Cannot mount %s (%d)", FILES_MOUNT_POINT, ret);
+		return ret;
+	}
+
+	ret = seed_demo_file();
+	if (ret < 0) {
+		LOG_WRN("Cannot seed the demo file (%d)", ret);
+	}
+
+	LOG_INF("Serving files from %s", FILES_MOUNT_POINT);
+
+	files_resource_detail.user_data = &bridge.server();
 
 	ret = bridge.start();
 	if (ret < 0) {

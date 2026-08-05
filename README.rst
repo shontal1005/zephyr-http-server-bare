@@ -2,7 +2,7 @@
    :name: HTTP server over a UART, without a network stack
    :relevant-api: http_server http_service socket_apis uart_interface
 
-   Serve HTTP over raw data buffers, with no L2, IP or TCP involved.
+   Download and upload files over a UART, with no L2, IP or TCP involved.
 
 Overview
 ********
@@ -10,7 +10,8 @@ Overview
 The Zephyr HTTP server always talks to its peers through a socket, but it never
 looks at what is behind that socket. This sample exploits that: it runs the
 stock HTTP server with **no network stack at all** underneath it, and feeds it
-raw bytes straight off a UART.
+raw bytes straight off a UART. What it serves is **files**: GET downloads one
+out of an already-mounted directory, PUT and POST upload one into it.
 
 There is no L2 driver, no IP and no TCP in the image. The only file descriptors
 in play are a :c:func:`socketpair` and a small custom listening socket.
@@ -24,7 +25,8 @@ The application-facing surface is a single C++ class, ``RawHttpServer``:
            my_link_write(data, len);        /* bytes out of the server */
    }
 
-   static RawHttpServer server(toMyLink);
+   /* second argument is the already-mounted directory files live in */
+   static RawHttpServer server(toMyLink, "/lfs");
 
    server.start();
    server.input(bytes_from_my_link, n);     /* bytes into the server */
@@ -34,6 +36,33 @@ a buffer and a size. That is the whole API; ``RawHttpServer`` knows nothing
 about UARTs. :file:`src/uart_bridge.cpp` is a separate class that connects the
 two, and is easy to replace with a USB endpoint, shared memory or a test
 harness.
+
+Files
+*****
+
+The constructor takes the path of a directory that is **already mounted** - the
+server never mounts anything itself. ``RawHttpServer::fileHandler`` is a
+resource callback registered under ``/files/``:
+
+.. code-block:: console
+
+   GET  /files/report.bin      download a file from <fs_root>/report.bin
+   PUT  /files/report.bin      upload the request body to that path
+   POST /files/report.bin      same as PUT
+
+Downloads stream through a fixed ``RAW_HTTP_FILE_CHUNK`` buffer, so file size is
+not bounded by RAM. Uploads are written straight through as body fragments
+arrive, so they are not bounded either. A missing file returns 404 and leaves
+the connection up.
+
+Because a dynamic resource is always chunked, responses carry
+``Transfer-Encoding: chunked`` rather than ``Content-Length``. That is valid
+HTTP/1.1 and every client handles it, but a progress bar cannot know the total
+in advance.
+
+Two deliberate limits: there is no directory listing, and the path from the URL
+is appended to the root without a traversal check, so anything reachable from
+the root with ``..`` is reachable over the link.
 
 The connection is persistent
 ****************************
@@ -170,18 +199,25 @@ Building and running
    :goals: build run
    :compact:
 
-At boot the sample injects three keep-alive requests on the UART's own
-connection, so the mechanism is visible without a terminal attached:
+``native_sim`` has nothing mounted, so the sample mounts a littlefs on the flash
+simulator at ``/lfs`` and seeds a ``hello.txt`` into it. A real board would have
+done that during boot and simply passed the path to the constructor.
+
+At boot the sample injects five keep-alive requests on the UART's own
+connection - including a download, an upload and a read-back - so the mechanism
+is visible without a terminal attached:
 
 .. code-block:: console
 
    <inf> uart_bridge: UART uart_1 wired to the HTTP server
    <inf> net_http_server_bare: --> request 1: feeding 30 bytes in two chunks
    <inf> net_http_server_bare:     connection still up: yes
-   <inf> net_http_server_bare: --> request 2: feeding 36 bytes in two chunks
-   <inf> net_http_server_bare:     connection still up: yes
-   <inf> net_http_server_bare: --> request 3: feeding 36 bytes in two chunks
-   <inf> net_http_server_bare:     connection still up: yes
+   <inf> net_http_server_bare: --> request 3: feeding 45 bytes in two chunks
+   <inf> raw_http: GET /lfs/hello.txt
+   <inf> net_http_server_bare: --> request 4: feeding 87 bytes in two chunks
+   <inf> raw_http: PUT /lfs/upload.txt
+   <inf> net_http_server_bare: --> request 5: feeding 46 bytes in two chunks
+   <inf> raw_http: GET /lfs/upload.txt
    <inf> net_http_server_bare: Self-test done, now serving the UART forever
 
 Note that each request is handed over in two separate calls. The server treats

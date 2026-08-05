@@ -28,7 +28,12 @@
 
 class UartBridge {
 public:
-	explicit UartBridge(const struct device *uart) : uart_(uart)
+	/**
+	 * @param uart The UART carrying the HTTP byte stream.
+	 * @param fs_root Already-mounted directory files are served from.
+	 */
+	UartBridge(const struct device *uart, const char *fs_root)
+		: uart_(uart), server_(onServerOutput, fs_root, this)
 	{
 	}
 
@@ -60,7 +65,7 @@ private:
 	void feedLoop();
 
 	const struct device *uart_;
-	RawHttpServer server_{onServerOutput, this};
+	RawHttpServer server_;
 	struct ring_buf rxRing_ {};
 	uint8_t rxRingBuf_[UART_BRIDGE_RING_SIZE]{};
 	struct k_sem rxSem_ {};

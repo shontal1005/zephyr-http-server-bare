@@ -688,3 +688,186 @@ RawHttpServer::~RawHttpServer()
 {
 	stop();
 }
+
+/*
+ * ---------------------------------------------------------------------------
+ * File transfers
+ * ---------------------------------------------------------------------------
+ */
+
+int RawHttpServer::buildPath(const char *url, char *out, size_t out_size)
+{
+	const size_t prefix_len = sizeof(RAW_HTTP_FILES_PREFIX) - 1;
+	const char *name;
+	const char *query;
+	size_t name_len;
+
+	if (strncmp(url, RAW_HTTP_FILES_PREFIX, prefix_len) != 0) {
+		return -ENOENT;
+	}
+
+	name = url + prefix_len;
+
+	/* A query string is not part of the filename. */
+	query = strchr(name, '?');
+	name_len = (query != nullptr) ? (size_t)(query - name) : strlen(name);
+
+	if (name_len == 0) {
+		return -ENOENT;
+	}
+
+	if (snprintk(out, out_size, "%s/%.*s", fsRoot_, (int)name_len, name) >= (int)out_size) {
+		return -ENAMETOOLONG;
+	}
+
+	return 0;
+}
+
+void RawHttpServer::closeTransfer()
+{
+	if (fileOpen_) {
+		(void)fs_close(&file_);
+		fileOpen_ = false;
+	}
+}
+
+int RawHttpServer::handleDownload(struct http_client_ctx *client,
+				  struct http_response_ctx *response_ctx)
+{
+	ssize_t got;
+
+	if (!fileOpen_) {
+		char path[RAW_HTTP_PATH_MAX];
+		int ret = buildPath(reinterpret_cast<const char *>(client->url_buffer), path,
+				    sizeof(path));
+
+		if (ret == 0) {
+			fs_file_t_init(&file_);
+			ret = fs_open(&file_, path, FS_O_READ);
+		}
+
+		if (ret < 0) {
+			LOG_INF("GET %s -> %d", (const char *)client->url_buffer, ret);
+			response_ctx->status = HTTP_404_NOT_FOUND;
+			response_ctx->final_chunk = true;
+			return 0;
+		}
+
+		LOG_INF("GET %s", path);
+		fileOpen_ = true;
+		response_ctx->status = HTTP_200_OK;
+	}
+
+	got = fs_read(&file_, fileBuf_, sizeof(fileBuf_));
+	if (got < 0) {
+		LOG_ERR("fs_read failed (%d)", (int)got);
+		closeTransfer();
+		return (int)got;
+	}
+
+	if (got == 0) {
+		/* End of file: nothing more to send. */
+		closeTransfer();
+		response_ctx->final_chunk = true;
+		return 0;
+	}
+
+	response_ctx->body = fileBuf_;
+	response_ctx->body_len = (size_t)got;
+
+	return 0;
+}
+
+int RawHttpServer::handleUpload(struct http_client_ctx *client,
+				enum http_transaction_status status,
+				const struct http_request_ctx *request_ctx,
+				struct http_response_ctx *response_ctx)
+{
+	if (!fileOpen_) {
+		char path[RAW_HTTP_PATH_MAX];
+		int ret = buildPath(reinterpret_cast<const char *>(client->url_buffer), path,
+				    sizeof(path));
+
+		if (ret == 0) {
+			fs_file_t_init(&file_);
+			ret = fs_open(&file_, path, FS_O_CREATE | FS_O_WRITE);
+		}
+
+		if (ret == 0) {
+			/* FS_O_CREATE does not truncate an existing file. */
+			ret = fs_truncate(&file_, 0);
+			if (ret < 0) {
+				(void)fs_close(&file_);
+			}
+		}
+
+		if (ret < 0) {
+			LOG_ERR("upload %s -> %d", (const char *)client->url_buffer, ret);
+			response_ctx->status = HTTP_400_BAD_REQUEST;
+			response_ctx->final_chunk = true;
+			return 0;
+		}
+
+		LOG_INF("%s %s", http_method_str((enum http_method)client->method), path);
+		fileOpen_ = true;
+	}
+
+	if (request_ctx->data_len > 0) {
+		ssize_t written = fs_write(&file_, request_ctx->data, request_ctx->data_len);
+
+		if (written < 0 || (size_t)written != request_ctx->data_len) {
+			LOG_ERR("fs_write failed (%d)", (int)written);
+			closeTransfer();
+			response_ctx->status = HTTP_500_INTERNAL_SERVER_ERROR;
+			response_ctx->final_chunk = true;
+			return 0;
+		}
+	}
+
+	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
+		closeTransfer();
+		response_ctx->status = HTTP_201_CREATED;
+		response_ctx->final_chunk = true;
+	}
+
+	return 0;
+}
+
+int RawHttpServer::handleFile(struct http_client_ctx *client, enum http_transaction_status status,
+			      const struct http_request_ctx *request_ctx,
+			      struct http_response_ctx *response_ctx)
+{
+	if (status == HTTP_SERVER_TRANSACTION_COMPLETE ||
+	    status == HTTP_SERVER_TRANSACTION_ABORTED) {
+		/* Terminal notifications: make sure nothing is left open. */
+		closeTransfer();
+		return 0;
+	}
+
+	switch (client->method) {
+	case HTTP_GET:
+		return handleDownload(client, response_ctx);
+
+	case HTTP_PUT:
+	case HTTP_POST:
+		return handleUpload(client, status, request_ctx, response_ctx);
+
+	default:
+		response_ctx->status = HTTP_400_BAD_REQUEST;
+		response_ctx->final_chunk = true;
+		return 0;
+	}
+}
+
+int RawHttpServer::fileHandler(struct http_client_ctx *client, enum http_transaction_status status,
+			       const struct http_request_ctx *request_ctx,
+			       struct http_response_ctx *response_ctx, void *user_data)
+{
+	RawHttpServer *self = static_cast<RawHttpServer *>(user_data);
+
+	if (self == nullptr) {
+		return -EINVAL;
+	}
+
+	return self->handleFile(client, status, request_ctx, response_ctx);
+}
