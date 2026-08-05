@@ -1,0 +1,4 @@
+name: raw-http-server
+build:
+  cmake: zephyr
+  kconfig: zephyr/Kconfig

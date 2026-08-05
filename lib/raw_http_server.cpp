@@ -12,9 +12,9 @@
 #include <zephyr/net/http/parser.h>
 #include <zephyr/sys/printk.h>
 
-#include "raw_http.hpp"
+#include "raw_http_server.hpp"
 
-LOG_MODULE_REGISTER(raw_http, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(raw_http, CONFIG_RAW_HTTP_LOG_LEVEL);
 
 namespace
 {
@@ -156,7 +156,7 @@ int RawHttpServer::on_headers_complete(struct http_parser *parser)
 		 * are written straight to the file - the class never buffers
 		 * the body, which is what makes upload size unbounded.
 		 */
-		char path[RAW_HTTP_PATH_MAX];
+		char path[CONFIG_RAW_HTTP_PATH_MAX];
 		int ret = self->build_path(path, sizeof(path));
 
 		if (ret < 0) {
@@ -258,10 +258,10 @@ int RawHttpServer::on_message_complete(struct http_parser *parser)
 
 int RawHttpServer::build_path(char *out, size_t out_size) const
 {
-	const size_t prefix_len = sizeof(RAW_HTTP_FILES_PREFIX) - 1;
+	const size_t prefix_len = sizeof(CONFIG_RAW_HTTP_FILES_PREFIX) - 1;
 
 	/* Anything outside /files/ simply does not exist here. */
-	if (strncmp(_url, RAW_HTTP_FILES_PREFIX, prefix_len) != 0) {
+	if (strncmp(_url, CONFIG_RAW_HTTP_FILES_PREFIX, prefix_len) != 0) {
 		return -ENOENT;
 	}
 
@@ -292,7 +292,7 @@ int RawHttpServer::build_path(char *out, size_t out_size) const
 
 void RawHttpServer::send_file()
 {
-	char path[RAW_HTTP_PATH_MAX];
+	char path[CONFIG_RAW_HTTP_PATH_MAX];
 	struct fs_dirent entry;
 	int ret = build_path(path, sizeof(path));
 

@@ -18,6 +18,10 @@
  * one into it. Everything runs synchronously inside input(): by the time it
  * returns, the response has been handed to the output callback.
  *
+ * The URL prefix, the URL/path bounds and the download chunk size are Kconfig
+ * options: CONFIG_RAW_HTTP_FILES_PREFIX, CONFIG_RAW_HTTP_URL_MAX,
+ * CONFIG_RAW_HTTP_PATH_MAX and CONFIG_RAW_HTTP_FILE_CHUNK.
+ *
  * @code
  * static void to_my_link(const uint8_t *data, size_t len, void *user)
  * {
@@ -30,8 +34,8 @@
  * @endcode
  */
 
-#ifndef RAW_HTTP_HPP_
-#define RAW_HTTP_HPP_
+#ifndef RAW_HTTP_SERVER_HPP_
+#define RAW_HTTP_SERVER_HPP_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -39,24 +43,6 @@
 #include <zephyr/fs/fs.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net/http/parser.h>
-
-/** URL prefix under which files are served. */
-#define RAW_HTTP_FILES_PREFIX "/files/"
-
-/** Longest URL accepted, query string included. Longer ones get a 414. */
-#define RAW_HTTP_URL_MAX 160
-
-/** Longest absolute filesystem path this server will build. */
-#define RAW_HTTP_PATH_MAX 128
-
-/**
- * Bytes read from the filesystem per output callback during a download.
- *
- * A pure throughput-vs-RAM tradeoff costing exactly this many bytes per
- * instance. Uploads do not use this buffer: the request body is written to the
- * file straight from the caller's input buffer.
- */
-#define RAW_HTTP_FILE_CHUNK 1600
 
 /**
  * @brief Serve files over HTTP/1.1, on buffers instead of a connection.
@@ -165,7 +151,7 @@ private:
 	/**
 	 * @brief Map the request URL to an absolute path under the fs root.
 	 *
-	 * Strips the query string, requires the RAW_HTTP_FILES_PREFIX, and
+	 * Strips the query string, requires CONFIG_RAW_HTTP_FILES_PREFIX, and
 	 * rejects ".." so nothing outside the root is reachable.
 	 *
 	 * @return 0 on success, -ENOENT for a URL outside the prefix or an
@@ -202,14 +188,14 @@ private:
 	struct k_mutex _lock {};
 
 	/* Per-request state, cleared by reset_request(). */
-	char _url[RAW_HTTP_URL_MAX]{};
+	char _url[CONFIG_RAW_HTTP_URL_MAX]{};
 	size_t _url_len{0};
 	struct fs_file_t _file {};
 	bool _file_open{false};
 	/** Nonzero once the request has failed; the status to answer with. */
 	unsigned int _error_status{0};
 
-	uint8_t _file_buf[RAW_HTTP_FILE_CHUNK]{};
+	uint8_t _file_buf[CONFIG_RAW_HTTP_FILE_CHUNK]{};
 };
 
-#endif /* RAW_HTTP_HPP_ */
+#endif /* RAW_HTTP_SERVER_HPP_ */

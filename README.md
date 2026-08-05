@@ -12,7 +12,7 @@ an already-mounted directory, PUT and POST upload one into it.
 
 ## The API
 
-One standalone class, [`src/raw_http.hpp`](src/raw_http.hpp). The output
+One standalone class, [`include/raw_http_server.hpp`](include/raw_http_server.hpp). The output
 callback is registered in the constructor; input is a buffer and a size. There
 is nothing to start:
 
@@ -31,9 +31,44 @@ server.input(bytes_from_my_link, n);     // bytes into the server
 That is the whole surface. Everything happens synchronously inside `input()`:
 by the time it returns, the response has been handed to the output callback.
 `RawHttpServer` knows nothing about UARTs —
-[`src/uart_bridge.cpp`](src/uart_bridge.cpp) is a separate class that wires the
+[`lib/uart_bridge.cpp`](lib/uart_bridge.cpp) is a separate class that wires the
 two together, and is easy to swap for a USB endpoint, shared memory, or a test
 harness.
+
+## Using it as a library
+
+The repository doubles as a **Zephyr module** ([`zephyr/module.yml`](zephyr/module.yml)):
+the server lives in `lib/` + `include/`, and `src/main.cpp` is just a sample
+app consuming it. From any other application:
+
+```cmake
+# CMakeLists.txt, before find_package(Zephyr)
+list(APPEND ZEPHYR_EXTRA_MODULES /path/to/zephyr-http-server-raw)
+```
+
+or list it as a project in your west manifest. Then in `prj.conf`:
+
+```
+CONFIG_RAW_HTTP_SERVER=y        # the server class
+CONFIG_RAW_HTTP_UART_BRIDGE=y   # optional - omit if you feed input() yourself
+```
+
+`RAW_HTTP_SERVER` selects `CPP`, `FILE_SYSTEM`, `HTTP_PARSER` and `NETWORKING`
+(the last one exists only to reach the parser's Kconfig menu — see the
+configuration notes). The bridge selects `UART_INTERRUPT_DRIVEN` and
+`RING_BUFFER`. Everything tunable is a Kconfig option:
+
+| Option | Default | |
+|---|---|---|
+| `CONFIG_RAW_HTTP_FILES_PREFIX` | `/files/` | URL prefix files are served under |
+| `CONFIG_RAW_HTTP_URL_MAX` | 160 | longest accepted URL (414 beyond) |
+| `CONFIG_RAW_HTTP_PATH_MAX` | 128 | longest filesystem path built |
+| `CONFIG_RAW_HTTP_FILE_CHUNK` | 1600 | download buffer, bytes per instance |
+| `CONFIG_RAW_HTTP_LOG_LEVEL` | inf | standard per-module log level |
+| `CONFIG_RAW_HTTP_UART_RING_SIZE` | 4096 | ISR-to-feed-thread ring |
+| `CONFIG_RAW_HTTP_UART_FEED_STACK` | 4096 | feed thread stack |
+| `CONFIG_RAW_HTTP_UART_FEED_PRIORITY` | 9 | feed thread priority (preemptible) |
+| `CONFIG_RAW_HTTP_UART_FEED_CHUNK` | 512 | bytes per input() call |
 
 ## Files
 
@@ -46,7 +81,7 @@ PUT  /files/report.bin      upload the request body to that path
 POST /files/report.bin      same as PUT
 ```
 
-Downloads stream through a `RAW_HTTP_FILE_CHUNK` buffer (1600 bytes), so file
+Downloads stream through a `CONFIG_RAW_HTTP_FILE_CHUNK` buffer (1600 bytes by default), so file
 size is not bounded by RAM; the size comes from `fs_stat()`, so responses carry
 a plain `Content-Length` — no chunked encoding, and a progress bar knows the
 total up front. Uploads never touch that buffer: body fragments are written to
@@ -159,10 +194,19 @@ device is opened raw, which is all a pty needs.
 
 ## Configuration notes
 
-`CONFIG_NETWORKING` stays set for one reason only: the parser library's Kconfig
-lives under the networking menu. `CONFIG_NET_NATIVE=n` keeps the IP stack,
-packet pools and connection tracking out of the build, and no socket, L2 or TCP
-option is enabled.
+`RAW_HTTP_SERVER` **selects** `NETWORKING` for one reason only: the parser
+library's Kconfig lives under the networking menu. `select` forces just that
+one symbol — sub-options like `NET_NATIVE` follow their own defaults, so the
+module's Kconfig flips `NET_NATIVE` to `default n` (module Kconfig files are
+sourced before the subsystem tree, and the first satisfied default wins).
+The result: no IP stack, no sockets, no TCP in the image, and an application
+that also wants real networking just sets `CONFIG_NET_NATIVE=y` back.
+
+One caveat: **board** `Kconfig.defconfig` files are sourced before modules and
+deliberately outrank them. `native_sim` switches Ethernet on whenever
+networking is in the build, so the sample's `prj.conf` carries an explicit
+`CONFIG_NET_L2_ETHERNET=n` — expect the same on any board that self-enables
+its network driver.
 
 ## Things to watch out for
 
@@ -178,7 +222,7 @@ option is enabled.
 - `UartBridge` transmits with `uart_poll_out()`, which busy-waits per byte.
   Fine at sane baud rates; switch to interrupt-driven TX if you push large
   responses at high speed.
-- If the UART RX ring (`UART_BRIDGE_RING_SIZE`) overflows, bytes are dropped
+- If the UART RX ring (`CONFIG_RAW_HTTP_UART_RING_SIZE`) overflows, bytes are dropped
   and the request stream desynchronises. The bridge logs an error. At any real
   baud rate the feed thread drains far faster than bytes arrive.
 - On `native_sim` that overflow is easy to trip artificially: a pseudoterminal

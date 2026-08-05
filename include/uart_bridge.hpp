@@ -21,10 +21,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/ring_buffer.h>
 
-#include "raw_http.hpp"
-
-/** Bytes buffered between the UART ISR and the feed thread. */
-#define UART_BRIDGE_RING_SIZE 4096
+#include "raw_http_server.hpp"
 
 class UartBridge {
 public:
@@ -103,7 +100,8 @@ private:
 	const struct device *_uart;
 	RawHttpServer _server;
 	struct ring_buf _rx_ring {};
-	uint8_t _rx_ring_buf[UART_BRIDGE_RING_SIZE]{};
+	/** Absorbs bytes arriving while input() is busy with file I/O. */
+	uint8_t _rx_ring_buf[CONFIG_RAW_HTTP_UART_RING_SIZE]{};
 	struct k_sem _rx_sem {};
 	struct k_thread _feed_thread {};
 };

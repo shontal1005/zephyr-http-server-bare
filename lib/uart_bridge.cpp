@@ -12,14 +12,10 @@
 
 #include "uart_bridge.hpp"
 
-LOG_MODULE_REGISTER(uart_bridge, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(uart_bridge, CONFIG_RAW_HTTP_LOG_LEVEL);
 
-#define UART_FEED_CHUNK 512
 /* input() runs the parser, the filesystem and the response TX on this stack. */
-#define UART_FEED_STACK    4096
-#define UART_FEED_PRIORITY K_PRIO_PREEMPT(9)
-
-K_THREAD_STACK_DEFINE(uart_feed_stack, UART_FEED_STACK);
+K_THREAD_STACK_DEFINE(uart_feed_stack, CONFIG_RAW_HTTP_UART_FEED_STACK);
 
 void UartBridge::on_server_output(const uint8_t *data, size_t len, void *user_data)
 {
@@ -82,7 +78,7 @@ void UartBridge::feed_trampoline(void *p1, void *p2, void *p3)
 
 void UartBridge::feed_loop()
 {
-	uint8_t buf[UART_FEED_CHUNK];
+	uint8_t buf[CONFIG_RAW_HTTP_UART_FEED_CHUNK];
 
 	while (true) {
 		uint32_t len;
@@ -121,7 +117,8 @@ int UartBridge::start()
 	 * first, then let the ISR begin filling the ring.
 	 */
 	k_thread_create(&_feed_thread, uart_feed_stack, K_THREAD_STACK_SIZEOF(uart_feed_stack),
-			feed_trampoline, this, nullptr, nullptr, UART_FEED_PRIORITY, 0, K_NO_WAIT);
+			feed_trampoline, this, nullptr, nullptr,
+			K_PRIO_PREEMPT(CONFIG_RAW_HTTP_UART_FEED_PRIORITY), 0, K_NO_WAIT);
 	(void)k_thread_name_set(&_feed_thread, "uart_feed");
 
 	uart_irq_callback_user_data_set(_uart, isr_trampoline, this);

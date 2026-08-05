@@ -22,8 +22,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/storage/flash_map.h>
 
-#include "raw_http.hpp"
-#include "uart_bridge.hpp"
+#include <raw_http_server.hpp>
+#include <uart_bridge.hpp>
 
 LOG_MODULE_REGISTER(http_server_bare, LOG_LEVEL_INF);
 
@@ -74,14 +74,14 @@ static UartBridge bridge(DEVICE_DT_GET(DT_ALIAS(http_uart)), FILES_MOUNT_POINT);
  */
 static const char *const selftest_requests[] = {
 	/* download the seeded file */
-	"GET " RAW_HTTP_FILES_PREFIX "hello.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+	"GET " CONFIG_RAW_HTTP_FILES_PREFIX "hello.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
 	/* upload a new one ... */
-	"PUT " RAW_HTTP_FILES_PREFIX "upload.txt HTTP/1.1\r\nHost: bare\r\n"
+	"PUT " CONFIG_RAW_HTTP_FILES_PREFIX "upload.txt HTTP/1.1\r\nHost: bare\r\n"
 	"Content-Length: 21\r\n\r\nuploaded over a UART\n",
 	/* ... and read it back */
-	"GET " RAW_HTTP_FILES_PREFIX "upload.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+	"GET " CONFIG_RAW_HTTP_FILES_PREFIX "upload.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
 	/* a missing file 404s and the stream keeps serving */
-	"GET " RAW_HTTP_FILES_PREFIX "missing.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+	"GET " CONFIG_RAW_HTTP_FILES_PREFIX "missing.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
 };
 
 static void run_selftest(RawHttpServer &server)

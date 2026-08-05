@@ -31,9 +31,28 @@ The application-facing surface is a single C++ class, ``RawHttpServer``:
 
 There is nothing to start: everything happens synchronously inside ``input()``,
 and by the time it returns the response has been handed to the output callback.
-``RawHttpServer`` knows nothing about UARTs. :file:`src/uart_bridge.cpp` is a
+``RawHttpServer`` knows nothing about UARTs. :file:`lib/uart_bridge.cpp` is a
 separate class that connects the two, and is easy to replace with a USB
 endpoint, shared memory or a test harness.
+
+Using it as a library
+*********************
+
+The repository is also a Zephyr module (:file:`zephyr/module.yml`): the server
+lives in :file:`lib/` and :file:`include/`, and :file:`src/main.cpp` is just a
+sample application consuming it. Add the repository to
+``ZEPHYR_EXTRA_MODULES`` or to a west manifest, then enable:
+
+.. code-block:: cfg
+
+   CONFIG_RAW_HTTP_SERVER=y        # the server class
+   CONFIG_RAW_HTTP_UART_BRIDGE=y   # optional; omit to feed input() yourself
+
+``RAW_HTTP_SERVER`` selects ``CPP``, ``FILE_SYSTEM``, ``HTTP_PARSER`` and
+``NETWORKING``; the bridge selects ``UART_INTERRUPT_DRIVEN`` and
+``RING_BUFFER``. The URL prefix, URL/path bounds, download chunk size, log
+level and all bridge parameters (ring size, feed thread stack, priority and
+chunk) are Kconfig options under the ``RAW_HTTP_SERVER`` menu.
 
 Files
 *****
@@ -47,7 +66,7 @@ server never mounts anything itself. Files are served under ``/files/``:
    PUT  /files/report.bin      upload the request body to that path
    POST /files/report.bin      same as PUT
 
-Downloads stream through a ``RAW_HTTP_FILE_CHUNK`` buffer (1600 bytes), so file
+Downloads stream through a ``CONFIG_RAW_HTTP_FILE_CHUNK`` buffer (1600 bytes by default), so file
 size is not bounded by RAM. The size comes from :c:func:`fs_stat`, so responses
 carry a plain ``Content-Length`` - no chunked encoding. Uploads never touch
 that buffer: body fragments are written to the file straight out of the
@@ -86,11 +105,20 @@ does file I/O.
 Configuration notes
 *******************
 
-:kconfig:option:`CONFIG_NETWORKING` stays set for one reason only: the parser
-library's Kconfig lives under the networking menu.
-:kconfig:option:`CONFIG_NET_NATIVE` is disabled, which keeps the IP stack,
-packet pools and connection tracking out of the build, and no socket, L2 or TCP
-option is enabled.
+``RAW_HTTP_SERVER`` selects :kconfig:option:`CONFIG_NETWORKING` for one reason
+only: the parser library's Kconfig lives under the networking menu. ``select``
+forces just that one symbol - sub-options such as
+:kconfig:option:`CONFIG_NET_NATIVE` follow their own defaults, so the module's
+Kconfig flips ``NET_NATIVE`` to ``default n`` (module Kconfig files are
+sourced before the subsystem tree, and the first satisfied default wins). The
+result is no IP stack, no sockets and no TCP in the image; an application that
+also wants real networking sets ``CONFIG_NET_NATIVE=y`` back.
+
+One caveat: board :file:`Kconfig.defconfig` files are sourced before modules
+and deliberately outrank them. ``native_sim`` switches Ethernet on whenever
+networking is in the build, so the sample's :file:`prj.conf` carries an
+explicit ``CONFIG_NET_L2_ETHERNET=n`` - expect the same on any board that
+self-enables its network driver.
 
 Wiring
 ******
@@ -190,7 +218,7 @@ Things to watch out for
 * ``UartBridge`` transmits with :c:func:`uart_poll_out`, which busy-waits per
   byte. That is fine at sane baud rates; switch to interrupt-driven TX if you
   push large responses at high speed.
-* If the UART RX ring (``UART_BRIDGE_RING_SIZE``) overflows, bytes are dropped
+* If the UART RX ring (``CONFIG_RAW_HTTP_UART_RING_SIZE``) overflows, bytes are dropped
   and the request stream desynchronises. The bridge logs an error when that
   happens. At any real baud rate the feed thread drains far faster than bytes
   arrive.
