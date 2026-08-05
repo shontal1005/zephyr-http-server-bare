@@ -25,11 +25,6 @@ namespace
  */
 constexpr size_t response_head_max = 96;
 
-/* Buffer for "<fs_root>/<name>". MAX_FILE_NAME (fs_interface.h) bounds a name,
- * not a full path, but with a short mount point it is plenty.
- */
-constexpr size_t path_max = MAX_FILE_NAME + 1;
-
 /* The handful of statuses this server actually emits. */
 const char *reason_of(unsigned int status)
 {
@@ -141,7 +136,7 @@ int RawHttpServer::on_headers_complete(struct http_parser *parser)
 		/* The destination must be open before the first body fragment:
 		 * fragments are written straight through, never buffered.
 		 */
-		char path[path_max];
+		char path[CONFIG_RAW_HTTP_PATH_MAX];
 		int ret = self->build_path(path, sizeof(path));
 
 		if (ret < 0) {
@@ -255,7 +250,7 @@ int RawHttpServer::build_path(char *out, size_t out_size) const
 
 void RawHttpServer::send_file()
 {
-	char path[path_max];
+	char path[CONFIG_RAW_HTTP_PATH_MAX];
 	struct fs_dirent entry;
 	int ret = build_path(path, sizeof(path));
 

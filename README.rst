@@ -49,7 +49,7 @@ sample code showing one way to feed it. Add the repository to
    CONFIG_RAW_HTTP_SERVER=y
 
 ``RAW_HTTP_SERVER`` selects ``CPP``, ``FILE_SYSTEM``, ``HTTP_PARSER`` and
-``NETWORKING``. The URL prefix, URL bound, download chunk size and log
+``NETWORKING``. The URL prefix, URL/path bounds, download chunk size and log
 level are Kconfig options under the ``RAW_HTTP_SERVER`` menu.
 
 Files

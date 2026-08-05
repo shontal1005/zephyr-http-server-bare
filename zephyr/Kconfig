@@ -32,6 +32,13 @@ config RAW_HTTP_URL_MAX
 	  Longer requests are answered with 414 URI Too Long rather than
 	  silently truncated. Costs this many bytes per server instance.
 
+config RAW_HTTP_PATH_MAX
+	int "Longest filesystem path built from a URL"
+	default 256
+	help
+	  Buffer for "<fs_root>/<name>". 256 covers the usual 255-character
+	  filesystem name limit; a longer result is answered with 404.
+
 config RAW_HTTP_FILE_CHUNK
 	int "Bytes read from the filesystem per output callback"
 	default 1600

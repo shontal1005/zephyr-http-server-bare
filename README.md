@@ -61,6 +61,7 @@ configuration notes). Everything tunable is a Kconfig option:
 |---|---|---|
 | `CONFIG_RAW_HTTP_FILES_PREFIX` | `/files/` | URL prefix files are served under |
 | `CONFIG_RAW_HTTP_URL_MAX` | 160 | longest accepted URL (414 beyond) |
+| `CONFIG_RAW_HTTP_PATH_MAX` | 256 | longest filesystem path built |
 | `CONFIG_RAW_HTTP_FILE_CHUNK` | 1600 | download buffer, bytes per instance |
 | `CONFIG_RAW_HTTP_LOG_LEVEL` | inf | standard per-module log level |
 

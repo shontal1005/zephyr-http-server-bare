@@ -18,10 +18,9 @@
  * one into it. Everything runs synchronously inside input(): by the time it
  * returns, the response has been handed to the output callback.
  *
- * The URL prefix, the URL bound and the download chunk size are Kconfig
- * options: CONFIG_RAW_HTTP_FILES_PREFIX, CONFIG_RAW_HTTP_URL_MAX and
- * CONFIG_RAW_HTTP_FILE_CHUNK. Filesystem paths are bounded by the
- * filesystem's own MAX_FILE_NAME.
+ * The URL prefix, the URL/path bounds and the download chunk size are Kconfig
+ * options: CONFIG_RAW_HTTP_FILES_PREFIX, CONFIG_RAW_HTTP_URL_MAX,
+ * CONFIG_RAW_HTTP_PATH_MAX and CONFIG_RAW_HTTP_FILE_CHUNK.
  *
  * @code
  * static void to_my_link(const uint8_t *data, size_t len, void *user)
