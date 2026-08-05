@@ -1,0 +1,25 @@
+/*
+ * Copyright (c) 2026 Zephyr Project contributors
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/ {
+	aliases {
+		/* The HTTP byte stream rides the Arduino D1/D0 pins; the
+		 * console keeps the ST-Link VCP on usart1.
+		 */
+		http-uart = &lpuart1;
+	};
+};
+
+/* Arduino D1 is LPUART1_TX on PG7, D0 is LPUART1_RX on PG8. The board dts
+ * leaves lpuart1 untouched, so pins and speed are set here. The board's own
+ * 120 KiB storage_partition provides the littlefs backing store.
+ */
+&lpuart1 {
+	pinctrl-0 = <&lpuart1_tx_pg7 &lpuart1_rx_pg8>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
