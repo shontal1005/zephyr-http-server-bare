@@ -48,8 +48,17 @@
 /** URL prefix under which files are served. Register the resource with it. */
 #define RAW_HTTP_FILES_PREFIX "/files/"
 
-/** Bytes moved to or from the filesystem per callback. */
-#define RAW_HTTP_FILE_CHUNK 512
+/**
+ * Bytes read from the filesystem per download callback.
+ *
+ * Pure throughput-vs-RAM tradeoff, and it costs exactly this many bytes inside
+ * every RawHttpServer instance. Nothing downstream constrains it: the chunked
+ * encoding re-states the length for each chunk, and a chunk larger than
+ * CONFIG_NET_SOCKETPAIR_BUFFER_SIZE simply makes the server's blocking send()
+ * drain in more than one go. Uploads do not use this buffer at all - they are
+ * written straight from the request body, whose size the client buffer governs.
+ */
+#define RAW_HTTP_FILE_CHUNK 1600
 
 /** Longest absolute path this server will build. */
 #define RAW_HTTP_PATH_MAX 128
@@ -213,7 +222,10 @@ private:
 	void *userData_;
 	const char *fsRoot_;
 
-	/* In-flight file transfer. Single-client by design, so one is enough. */
+	/* In-flight file transfer. Single-client by design, so one is enough.
+	 * Separate from rxBuf_ on purpose: the RX thread may be draining a
+	 * response into the output callback while the server thread fills this.
+	 */
 	struct fs_file_t file_ {};
 	bool fileOpen_{false};
 	uint8_t fileBuf_[RAW_HTTP_FILE_CHUNK]{};

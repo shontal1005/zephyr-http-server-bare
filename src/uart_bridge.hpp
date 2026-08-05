@@ -24,7 +24,7 @@
 #include "raw_http.hpp"
 
 /** Bytes buffered between the UART ISR and the feed thread. */
-#define UART_BRIDGE_RING_SIZE 1024
+#define UART_BRIDGE_RING_SIZE 4096
 
 class UartBridge {
 public:

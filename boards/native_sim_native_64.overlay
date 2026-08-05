@@ -14,3 +14,13 @@
 &uart1 {
 	status = "okay";
 };
+
+/*
+ * native_sim's stock storage partition is 16 KiB, and littlefs metadata eats
+ * most of that - uploads fail with -ENOSPC after a few hundred bytes. Grow it
+ * into the unused top half of the 2 MiB simulated flash so the sample has room
+ * for real files.
+ */
+&storage_partition {
+	reg = <0x000fc000 0x00100000>;
+};

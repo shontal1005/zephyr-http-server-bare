@@ -46,12 +46,16 @@ PUT  /files/report.bin      upload the request body to that path
 POST /files/report.bin      same as PUT
 ```
 
-Downloads stream through a fixed `RAW_HTTP_FILE_CHUNK` buffer, so file size is
-not bounded by RAM. Uploads are written straight through as body fragments
+Downloads stream through a `RAW_HTTP_FILE_CHUNK` buffer (1600 bytes), so file
+size is not bounded by RAM. That size is a plain throughput-vs-RAM tradeoff and
+costs exactly that many bytes per instance — nothing downstream constrains it,
+because the chunked encoding re-states the length of every chunk and a chunk
+larger than the socketpair buffer just drains in more than one `send()`. Uploads
+never touch it: the body is written straight through. Uploads are written straight through as body fragments
 arrive, so they are not bounded either. A missing file returns 404 and leaves the
 connection up.
 
-Verified over the real UART: a 285-byte upload round-tripped byte for byte, a
+Verified over the real UART: a 5035-byte upload round-tripped byte for byte, a
 404 did not kill the link, and five file operations ran back to back on one
 connection with zero reconnects.
 
@@ -151,7 +155,9 @@ west build -b native_sim /path/to/zephyr-http-server-bare
 ```
 
 `native_sim` has nothing mounted, so the sample mounts a littlefs on the flash
-simulator at `/lfs` and seeds a `hello.txt` into it. A real board would have done
+simulator at `/lfs` and seeds a `hello.txt` into it. The board overlay also grows
+`storage_partition` from its stock 16 KiB to 1 MiB — littlefs metadata eats most
+of 16 KiB, and uploads otherwise fail with `-ENOSPC` after a few hundred bytes. A real board would have done
 that during boot and simply passed the path to the constructor.
 
 At boot it injects five keep-alive requests on the UART's own connection —
@@ -242,8 +248,14 @@ fields are bound by `CONFIG_HTTP_SERVER_MAX_HEADER_LEN`.
 - `UartBridge` transmits with `uart_poll_out()`, which busy-waits per byte. Fine
   at sane baud rates; switch to interrupt-driven TX with a second ring buffer if
   you push large responses at high speed.
-- If the UART RX ring overflows, bytes are dropped and the request stream
-  desynchronises. The bridge logs an error when that happens.
+- If the UART RX ring (`UART_BRIDGE_RING_SIZE`) overflows, bytes are dropped and
+  the request stream desynchronises. The bridge logs an error. At any real baud
+  rate the feed thread drains far faster than bytes arrive; the ring only has to
+  absorb what lands while that thread is busy inside `input()`.
+- On `native_sim` this is easy to trip artificially: a pseudoterminal has no baud
+  rate, and native_pty's interrupt-emulation thread runs at
+  `K_HIGHEST_THREAD_PRIO` without sleeping, so it hands over a whole burst before
+  the feed thread is scheduled at all. Pace host writes for large uploads.
 - One `RawHttpServer` instance at a time: the listening socket is a
   process-wide singleton, so a second concurrent `start()` returns `-EEXIST`.
   This is a single-client design by construction.

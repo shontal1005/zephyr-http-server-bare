@@ -50,8 +50,12 @@ resource callback registered under ``/files/``:
    PUT  /files/report.bin      upload the request body to that path
    POST /files/report.bin      same as PUT
 
-Downloads stream through a fixed ``RAW_HTTP_FILE_CHUNK`` buffer, so file size is
-not bounded by RAM. Uploads are written straight through as body fragments
+Downloads stream through a ``RAW_HTTP_FILE_CHUNK`` buffer (1600 bytes), so file
+size is not bounded by RAM. That size is a plain throughput-vs-RAM tradeoff and
+costs exactly that many bytes per instance: nothing downstream constrains it,
+because the chunked encoding re-states the length of every chunk and a chunk
+larger than the socketpair buffer just drains in more than one ``send()``.
+Uploads never touch it - the body is written straight through. Uploads are written straight through as body fragments
 arrive, so they are not bounded either. A missing file returns 404 and leaves
 the connection up.
 
@@ -200,7 +204,10 @@ Building and running
    :compact:
 
 ``native_sim`` has nothing mounted, so the sample mounts a littlefs on the flash
-simulator at ``/lfs`` and seeds a ``hello.txt`` into it. A real board would have
+simulator at ``/lfs`` and seeds a ``hello.txt`` into it. The board overlay also
+grows ``storage_partition`` from its stock 16 KiB to 1 MiB - littlefs metadata
+consumes most of 16 KiB, and uploads otherwise fail with ``-ENOSPC`` after a few
+hundred bytes. A real board would have
 done that during boot and simply passed the path to the constructor.
 
 At boot the sample injects five keep-alive requests on the UART's own
@@ -247,8 +254,16 @@ Things to watch out for
 * ``UartBridge`` transmits with :c:func:`uart_poll_out`, which busy-waits per
   byte. That is fine at sane baud rates; switch to interrupt-driven TX with a
   second ring buffer if you push large responses at high speed.
-* If the UART RX ring overflows, bytes are dropped and the request stream
-  desynchronises. The bridge logs an error when that happens.
+* If the UART RX ring (``UART_BRIDGE_RING_SIZE``) overflows, bytes are dropped
+  and the request stream desynchronises. The bridge logs an error when that
+  happens. At any real baud rate the feed thread drains far faster than bytes
+  arrive; the ring only has to absorb what lands while that thread is busy
+  inside ``input()``.
+* On ``native_sim`` this is easy to trip artificially: a pseudoterminal has no
+  baud rate, and native_pty's interrupt-emulation thread runs at
+  ``K_HIGHEST_THREAD_PRIO`` without sleeping, so it hands over an entire burst
+  before the feed thread is scheduled at all. Pace writes from the host if you
+  are pushing large uploads into the simulator.
 * HTTP has no framing below it, and TCP is no longer providing reliability or
   ordering either. Bytes must arrive in order, exactly once, with no gaps; a
   dropped or duplicated byte makes the parser return ``-EBADMSG`` and the server
