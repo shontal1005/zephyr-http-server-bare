@@ -23,7 +23,8 @@
 #include <zephyr/storage/flash_map.h>
 
 #include <raw_http_server.hpp>
-#include <uart_bridge.hpp>
+
+#include "uart_bridge.hpp"
 
 LOG_MODULE_REGISTER(http_server_bare, LOG_LEVEL_INF);
 

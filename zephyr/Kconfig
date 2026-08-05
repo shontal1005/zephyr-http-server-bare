@@ -51,44 +51,6 @@ module = RAW_HTTP
 module-str = raw_http
 source "subsys/logging/Kconfig.template.log_config"
 
-config RAW_HTTP_UART_BRIDGE
-	bool "UART bridge"
-	depends on SERIAL
-	select UART_INTERRUPT_DRIVEN
-	select RING_BUFFER
-	help
-	  Wire a UART straight into the server: ISR -> ring buffer -> feed
-	  thread -> RawHttpServer::input(). Disable it when the byte stream
-	  comes from somewhere else (USB, shared memory, a test harness) and
-	  call input() yourself.
-
-if RAW_HTTP_UART_BRIDGE
-
-config RAW_HTTP_UART_RING_SIZE
-	int "Bytes buffered between the UART ISR and the feed thread"
-	default 4096
-	help
-	  Absorbs bytes that arrive while the server is busy with file I/O.
-	  An overflow drops bytes (with an error log) and desynchronises the
-	  request stream.
-
-config RAW_HTTP_UART_FEED_STACK
-	int "Feed thread stack size"
-	default 4096
-	help
-	  input() runs the parser, the filesystem and the response TX on
-	  this stack.
-
-config RAW_HTTP_UART_FEED_PRIORITY
-	int "Feed thread preemptible priority"
-	default 9
-
-config RAW_HTTP_UART_FEED_CHUNK
-	int "Bytes handed to input() per ring buffer read"
-	default 512
-
-endif # RAW_HTTP_UART_BRIDGE
-
 endif # RAW_HTTP_SERVER
 
 # Module Kconfig files are sourced before the subsystem tree, and the first

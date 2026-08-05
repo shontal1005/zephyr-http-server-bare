@@ -31,15 +31,16 @@ server.input(bytes_from_my_link, n);     // bytes into the server
 That is the whole surface. Everything happens synchronously inside `input()`:
 by the time it returns, the response has been handed to the output callback.
 `RawHttpServer` knows nothing about UARTs —
-[`lib/uart_bridge.cpp`](lib/uart_bridge.cpp) is a separate class that wires the
+[`src/uart_bridge.cpp`](src/uart_bridge.cpp) is a separate class that wires the
 two together, and is easy to swap for a USB endpoint, shared memory, or a test
 harness.
 
 ## Using it as a library
 
-The repository doubles as a **Zephyr module** ([`zephyr/module.yml`](zephyr/module.yml)):
-the server lives in `lib/` + `include/`, and `src/main.cpp` is just a sample
-app consuming it. From any other application:
+The repository doubles as a **Zephyr module** ([`zephyr/module.yml`](zephyr/module.yml)).
+The library is `RawHttpServer` alone, in `lib/` + `include/`; everything under
+`src/` — the app and the UART bridge — is sample code showing one way to feed
+it. From any other application:
 
 ```cmake
 # CMakeLists.txt, before find_package(Zephyr)
@@ -49,14 +50,12 @@ list(APPEND ZEPHYR_EXTRA_MODULES /path/to/zephyr-http-server-raw)
 or list it as a project in your west manifest. Then in `prj.conf`:
 
 ```
-CONFIG_RAW_HTTP_SERVER=y        # the server class
-CONFIG_RAW_HTTP_UART_BRIDGE=y   # optional - omit if you feed input() yourself
+CONFIG_RAW_HTTP_SERVER=y
 ```
 
 `RAW_HTTP_SERVER` selects `CPP`, `FILE_SYSTEM`, `HTTP_PARSER` and `NETWORKING`
 (the last one exists only to reach the parser's Kconfig menu — see the
-configuration notes). The bridge selects `UART_INTERRUPT_DRIVEN` and
-`RING_BUFFER`. Everything tunable is a Kconfig option:
+configuration notes). Everything tunable is a Kconfig option:
 
 | Option | Default | |
 |---|---|---|
@@ -65,10 +64,6 @@ configuration notes). The bridge selects `UART_INTERRUPT_DRIVEN` and
 | `CONFIG_RAW_HTTP_PATH_MAX` | 128 | longest filesystem path built |
 | `CONFIG_RAW_HTTP_FILE_CHUNK` | 1600 | download buffer, bytes per instance |
 | `CONFIG_RAW_HTTP_LOG_LEVEL` | inf | standard per-module log level |
-| `CONFIG_RAW_HTTP_UART_RING_SIZE` | 4096 | ISR-to-feed-thread ring |
-| `CONFIG_RAW_HTTP_UART_FEED_STACK` | 4096 | feed thread stack |
-| `CONFIG_RAW_HTTP_UART_FEED_PRIORITY` | 9 | feed thread priority (preemptible) |
-| `CONFIG_RAW_HTTP_UART_FEED_CHUNK` | 512 | bytes per input() call |
 
 ## Files
 
@@ -222,7 +217,7 @@ its network driver.
 - `UartBridge` transmits with `uart_poll_out()`, which busy-waits per byte.
   Fine at sane baud rates; switch to interrupt-driven TX if you push large
   responses at high speed.
-- If the UART RX ring (`CONFIG_RAW_HTTP_UART_RING_SIZE`) overflows, bytes are dropped
+- If the UART RX ring (`UART_BRIDGE_RING_SIZE`) overflows, bytes are dropped
   and the request stream desynchronises. The bridge logs an error. At any real
   baud rate the feed thread drains far faster than bytes arrive.
 - On `native_sim` that overflow is easy to trip artificially: a pseudoterminal

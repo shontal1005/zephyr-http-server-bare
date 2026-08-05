@@ -6,6 +6,4 @@ if(CONFIG_RAW_HTTP_SERVER)
 
   zephyr_library_named(raw_http_server)
   zephyr_library_sources(${CMAKE_CURRENT_LIST_DIR}/../lib/raw_http_server.cpp)
-  zephyr_library_sources_ifdef(CONFIG_RAW_HTTP_UART_BRIDGE
-    ${CMAKE_CURRENT_LIST_DIR}/../lib/uart_bridge.cpp)
 endif()

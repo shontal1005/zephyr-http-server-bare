@@ -31,28 +31,26 @@ The application-facing surface is a single C++ class, ``RawHttpServer``:
 
 There is nothing to start: everything happens synchronously inside ``input()``,
 and by the time it returns the response has been handed to the output callback.
-``RawHttpServer`` knows nothing about UARTs. :file:`lib/uart_bridge.cpp` is a
+``RawHttpServer`` knows nothing about UARTs. :file:`src/uart_bridge.cpp` is a
 separate class that connects the two, and is easy to replace with a USB
 endpoint, shared memory or a test harness.
 
 Using it as a library
 *********************
 
-The repository is also a Zephyr module (:file:`zephyr/module.yml`): the server
-lives in :file:`lib/` and :file:`include/`, and :file:`src/main.cpp` is just a
-sample application consuming it. Add the repository to
+The repository is also a Zephyr module (:file:`zephyr/module.yml`). The
+library is ``RawHttpServer`` alone, in :file:`lib/` and :file:`include/`;
+everything under :file:`src/` - the application and the UART bridge - is
+sample code showing one way to feed it. Add the repository to
 ``ZEPHYR_EXTRA_MODULES`` or to a west manifest, then enable:
 
 .. code-block:: cfg
 
-   CONFIG_RAW_HTTP_SERVER=y        # the server class
-   CONFIG_RAW_HTTP_UART_BRIDGE=y   # optional; omit to feed input() yourself
+   CONFIG_RAW_HTTP_SERVER=y
 
 ``RAW_HTTP_SERVER`` selects ``CPP``, ``FILE_SYSTEM``, ``HTTP_PARSER`` and
-``NETWORKING``; the bridge selects ``UART_INTERRUPT_DRIVEN`` and
-``RING_BUFFER``. The URL prefix, URL/path bounds, download chunk size, log
-level and all bridge parameters (ring size, feed thread stack, priority and
-chunk) are Kconfig options under the ``RAW_HTTP_SERVER`` menu.
+``NETWORKING``. The URL prefix, URL/path bounds, download chunk size and log
+level are Kconfig options under the ``RAW_HTTP_SERVER`` menu.
 
 Files
 *****
@@ -218,7 +216,7 @@ Things to watch out for
 * ``UartBridge`` transmits with :c:func:`uart_poll_out`, which busy-waits per
   byte. That is fine at sane baud rates; switch to interrupt-driven TX if you
   push large responses at high speed.
-* If the UART RX ring (``CONFIG_RAW_HTTP_UART_RING_SIZE``) overflows, bytes are dropped
+* If the UART RX ring (``UART_BRIDGE_RING_SIZE``) overflows, bytes are dropped
   and the request stream desynchronises. The bridge logs an error when that
   happens. At any real baud rate the feed thread drains far faster than bytes
   arrive.

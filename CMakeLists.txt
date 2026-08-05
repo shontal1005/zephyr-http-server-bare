@@ -10,4 +10,7 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(http_server_bare CXX)
 
-target_sources(app PRIVATE src/main.cpp)
+target_sources(app PRIVATE
+  src/main.cpp
+  src/uart_bridge.cpp
+)
