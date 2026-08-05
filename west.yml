@@ -1,0 +1,30 @@
+# Copyright (c) 2026 Zephyr Project contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# West manifest for building this application as its own workspace:
+#
+#   mkdir bare-http && cd bare-http
+#   git clone <this repo> zephyr-http-server-raw
+#   west init -l zephyr-http-server-raw
+#   west update
+#   west build -b native_sim zephyr-http-server-raw
+#
+# Only littlefs is pulled in besides Zephyr itself: the sample needs no HALs on
+# native_sim and no other modules. Extend name-allowlist when targeting real
+# hardware that needs its vendor HAL.
+
+manifest:
+  self:
+    path: zephyr-http-server-raw
+
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.4.0
+      import:
+        name-allowlist:
+          - littlefs

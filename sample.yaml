@@ -10,22 +10,19 @@ common:
     regex:
       - "UART .* wired to the HTTP server"
       - "request 1: feeding .* bytes in two chunks"
-      - "connection still up: yes"
-      - "request 3: feeding .* bytes in two chunks"
       - "GET /lfs/hello.txt"
-      - "request 4: feeding .* bytes in two chunks"
+      - "request 2: feeding .* bytes in two chunks"
       - "PUT /lfs/upload.txt"
-      - "request 5: feeding .* bytes in two chunks"
+      - "request 3: feeding .* bytes in two chunks"
       - "GET /lfs/upload.txt"
+      - "request 4: feeding .* bytes in two chunks"
+      - "GET /files/missing.txt"
       - "Self-test done"
   tags:
     - http
-    - net
-    - server
-    - socket
     - uart
     - filesystem
   integration_platforms:
     - native_sim
 tests:
-  sample.net.sockets.http.server.bare: {}
+  sample.net.http.server.bare: {}

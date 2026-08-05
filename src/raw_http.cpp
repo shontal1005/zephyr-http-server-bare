@@ -9,865 +9,373 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/net/http/server.h>
-#include <zephyr/net/socket.h>
-#include <zephyr/sys/fdtable.h>
+#include <zephyr/net/http/parser.h>
+#include <zephyr/sys/printk.h>
 
 #include "raw_http.hpp"
 
 LOG_MODULE_REGISTER(raw_http, LOG_LEVEL_INF);
 
-#define RAW_MAX_PENDING   2
-/* zvfs_poll_internal() puts a k_poll_event[CONFIG_ZVFS_POLL_MAX] on the
- * caller's stack, so anything that calls poll() needs real headroom.
- */
-#define RAW_RX_STACK_SIZE 2048
-#define RAW_RX_PRIORITY   K_PRIO_PREEMPT(8)
-
-/* Retry cadence and overall give-up bound for a blocked input(). */
-#define RAW_TX_RETRY_MS   2
-#define RAW_TX_TIMEOUT_MS 5000
-
-/* How long poll() parks before rechecking running_. Bounds how long stop()
- * takes; an idle link costs one wakeup per interval and nothing else.
- */
-#define RAW_POLL_TIMEOUT_MS 500
-
-K_THREAD_STACK_DEFINE(raw_rx_stack, RAW_RX_STACK_SIZE);
-
 namespace
 {
 
-/*
- * The listening socket.
- *
- * The HTTP server only ever does four things with it: setsockopt(), bind(),
- * listen(), then poll()+accept() in a loop. bind() and listen() are no-ops
- * here, poll() is backed by a k_poll_signal, and accept() pops a socketpair end
- * that RawHttpServer::link() queued.
- *
- * It is deliberately a singleton: HTTP_SERVICE_DEFINE() registers exactly one
- * service, and this sample serves exactly one client.
- */
-struct Listener {
-	struct k_poll_signal acceptSig;
-	struct k_spinlock lock;
-	int pending[RAW_MAX_PENDING];
-	uint8_t pendingCount;
-	bool inUse;
-};
-
-Listener listener;
-struct socket_op_vtable listenerVtable;
-
-ssize_t listenerRead(void *obj, void *buf, size_t sz)
+/* The handful of statuses this server actually emits. */
+const char *reason_of(unsigned int status)
 {
-	ARG_UNUSED(obj);
-	ARG_UNUSED(buf);
-	ARG_UNUSED(sz);
-
-	errno = EOPNOTSUPP;
-	return -1;
-}
-
-ssize_t listenerWrite(void *obj, const void *buf, size_t sz)
-{
-	ARG_UNUSED(obj);
-	ARG_UNUSED(buf);
-	ARG_UNUSED(sz);
-
-	errno = EOPNOTSUPP;
-	return -1;
-}
-
-/* Registered as close2(): zvfs_close() calls that union member, not close(),
- * whenever the descriptor was finalised with ZVFS_MODE_IFSOCK.
- */
-int listenerClose(void *obj, int fd)
-{
-	int fds[RAW_MAX_PENDING];
-	uint8_t count;
-
-	ARG_UNUSED(obj);
-	ARG_UNUSED(fd);
-
-	k_spinlock_key_t key = k_spin_lock(&listener.lock);
-
-	count = listener.pendingCount;
-	memcpy(fds, listener.pending, count * sizeof(fds[0]));
-	listener.pendingCount = 0;
-	listener.inUse = false;
-
-	k_spin_unlock(&listener.lock, key);
-
-	/* Drop connections that were queued but never accepted. */
-	for (uint8_t i = 0; i < count; i++) {
-		(void)zsock_close(fds[i]);
-	}
-
-	return 0;
-}
-
-int listenerPollPrepare(struct zsock_pollfd *pfd, struct k_poll_event **pev,
-			struct k_poll_event *pev_end)
-{
-	if ((pfd->events & ZSOCK_POLLIN) == 0) {
-		return 0;
-	}
-
-	if (*pev == pev_end) {
-		/* zvfs_poll_internal() does errno = -result, so these ioctls
-		 * must return a negative errno rather than -1.
-		 */
-		return -ENOMEM;
-	}
-
-	/* Clear a stale signal before blocking. Anything queued after this
-	 * point raises the signal again and wakes the poll up.
-	 */
-	k_spinlock_key_t key = k_spin_lock(&listener.lock);
-
-	if (listener.pendingCount == 0) {
-		k_poll_signal_reset(&listener.acceptSig);
-	}
-
-	k_spin_unlock(&listener.lock, key);
-
-	(*pev)->obj = &listener.acceptSig;
-	(*pev)->type = K_POLL_TYPE_SIGNAL;
-	(*pev)->mode = K_POLL_MODE_NOTIFY_ONLY;
-	(*pev)->state = K_POLL_STATE_NOT_READY;
-	(*pev)++;
-
-	return 0;
-}
-
-int listenerPollUpdate(struct zsock_pollfd *pfd, struct k_poll_event **pev)
-{
-	if ((pfd->events & ZSOCK_POLLIN) == 0) {
-		return 0;
-	}
-
-	/* Readiness comes from the queue, not from the signal state. */
-	k_spinlock_key_t key = k_spin_lock(&listener.lock);
-
-	if (listener.pendingCount > 0) {
-		pfd->revents |= ZSOCK_POLLIN;
-	}
-
-	k_spin_unlock(&listener.lock, key);
-
-	(*pev)++;
-
-	return 0;
-}
-
-int listenerIoctl(void *obj, unsigned int request, va_list args)
-{
-	ARG_UNUSED(obj);
-
-	switch (request) {
-	case ZFD_IOCTL_POLL_PREPARE: {
-		struct zsock_pollfd *pfd = va_arg(args, struct zsock_pollfd *);
-		struct k_poll_event **pev = va_arg(args, struct k_poll_event **);
-		struct k_poll_event *pev_end = va_arg(args, struct k_poll_event *);
-
-		return listenerPollPrepare(pfd, pev, pev_end);
-	}
-
-	case ZFD_IOCTL_POLL_UPDATE: {
-		struct zsock_pollfd *pfd = va_arg(args, struct zsock_pollfd *);
-		struct k_poll_event **pev = va_arg(args, struct k_poll_event **);
-
-		return listenerPollUpdate(pfd, pev);
-	}
-
+	switch (status) {
+	case 200:
+		return "OK";
+	case 201:
+		return "Created";
+	case 400:
+		return "Bad Request";
+	case 404:
+		return "Not Found";
+	case 405:
+		return "Method Not Allowed";
+	case 414:
+		return "URI Too Long";
 	default:
-		return -EOPNOTSUPP;
+		return "Internal Server Error";
 	}
 }
-
-int listenerBind(void *obj, const struct net_sockaddr *addr, net_socklen_t addrlen)
-{
-	ARG_UNUSED(obj);
-	ARG_UNUSED(addr);
-	ARG_UNUSED(addrlen);
-
-	/* There is no address space to bind to; accept the call so that
-	 * http_server_init() keeps going.
-	 */
-	return 0;
-}
-
-int listenerListen(void *obj, int backlog)
-{
-	ARG_UNUSED(obj);
-	ARG_UNUSED(backlog);
-
-	return 0;
-}
-
-int listenerAccept(void *obj, struct net_sockaddr *addr, net_socklen_t *addrlen)
-{
-	int fd;
-
-	ARG_UNUSED(obj);
-	ARG_UNUSED(addr);
-
-	k_spinlock_key_t key = k_spin_lock(&listener.lock);
-
-	if (listener.pendingCount == 0) {
-		k_spin_unlock(&listener.lock, key);
-		errno = EAGAIN;
-		return -1;
-	}
-
-	fd = listener.pending[0];
-	listener.pendingCount--;
-	memmove(&listener.pending[0], &listener.pending[1],
-		listener.pendingCount * sizeof(listener.pending[0]));
-
-	k_spin_unlock(&listener.lock, key);
-
-	/* Report an empty peer address. The caller zeroes the storage first, so
-	 * it stays NET_AF_UNSPEC.
-	 */
-	if (addrlen != nullptr) {
-		*addrlen = 0;
-	}
-
-	return fd;
-}
-
-int listenerGetsockopt(void *obj, int level, int optname, void *optval, net_socklen_t *optlen)
-{
-	ARG_UNUSED(obj);
-	ARG_UNUSED(level);
-	ARG_UNUSED(optname);
-
-	/* Only ever reached through the server's SO_ERROR read on POLLERR,
-	 * which this listener never reports.
-	 */
-	if (optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {
-		*static_cast<int *>(optval) = 0;
-		*optlen = sizeof(int);
-	}
-
-	return 0;
-}
-
-int listenerSetsockopt(void *obj, int level, int optname, const void *optval, net_socklen_t optlen)
-{
-	ARG_UNUSED(obj);
-	ARG_UNUSED(level);
-	ARG_UNUSED(optname);
-	ARG_UNUSED(optval);
-	ARG_UNUSED(optlen);
-
-	/* SO_REUSEADDR and friends are meaningless here, but the server
-	 * abandons the service if setsockopt() fails.
-	 */
-	return 0;
-}
-
-/* Filled in field by field rather than with a designated initialiser, because
- * fd_op_vtable puts read/write/close inside anonymous unions.
- */
-void initListenerVtable()
-{
-	listenerVtable.fd_vtable.read = listenerRead;
-	listenerVtable.fd_vtable.write = listenerWrite;
-	listenerVtable.fd_vtable.close2 = listenerClose;
-	listenerVtable.fd_vtable.ioctl = listenerIoctl;
-	listenerVtable.bind = listenerBind;
-	listenerVtable.listen = listenerListen;
-	listenerVtable.accept = listenerAccept;
-	listenerVtable.getsockopt = listenerGetsockopt;
-	listenerVtable.setsockopt = listenerSetsockopt;
-}
-
-/* Queue an accepted descriptor and wake the server's poll() up. */
-int listenerPush(int fd)
-{
-	k_spinlock_key_t key = k_spin_lock(&listener.lock);
-
-	if (!listener.inUse) {
-		k_spin_unlock(&listener.lock, key);
-		return -ENOTCONN;
-	}
-
-	if (listener.pendingCount == ARRAY_SIZE(listener.pending)) {
-		k_spin_unlock(&listener.lock, key);
-		return -ENOSPC;
-	}
-
-	listener.pending[listener.pendingCount++] = fd;
-
-	k_spin_unlock(&listener.lock, key);
-
-	/* Must be raised outside the spinlock, it may reschedule. */
-	k_poll_signal_raise(&listener.acceptSig, 0);
-
-	return 0;
-}
-
-/* Close anything queued but never accepted, so a teardown before the server
- * got round to accept() does not strand a descriptor in the listener.
- */
-void listenerDrainPending()
-{
-	int fds[RAW_MAX_PENDING];
-	uint8_t count;
-
-	k_spinlock_key_t key = k_spin_lock(&listener.lock);
-
-	count = listener.pendingCount;
-	memcpy(fds, listener.pending, count * sizeof(fds[0]));
-	listener.pendingCount = 0;
-
-	k_spin_unlock(&listener.lock, key);
-
-	for (uint8_t i = 0; i < count; i++) {
-		(void)zsock_close(fds[i]);
-	}
-}
-
-/* The running instance, so the RX thread trampoline can find it. */
-RawHttpServer *instance;
 
 } /* namespace */
 
-int RawHttpServer::socketCreate(const struct http_service_desc *svc, int af, int proto)
+/* Only four of the parser's ten callbacks are needed: everything between them
+ * (status line, header fields, chunk framing) is handled inside the parser
+ * itself and never has to surface here.
+ */
+const struct http_parser_settings RawHttpServer::_settings = {
+	.on_url = &RawHttpServer::on_url,
+	.on_headers_complete = &RawHttpServer::on_headers_complete,
+	.on_body = &RawHttpServer::on_body,
+	.on_message_complete = &RawHttpServer::on_message_complete,
+};
+
+RawHttpServer::RawHttpServer(OutputCallback cb, const char *fs_root, void *user_data)
+	: _cb(cb), _user_data(user_data), _fs_root(fs_root)
 {
-	int fd;
+	k_mutex_init(&_lock);
 
-	ARG_UNUSED(svc);
-	ARG_UNUSED(af);
-	ARG_UNUSED(proto);
-
-	fd = zvfs_reserve_fd();
-	if (fd < 0) {
-		errno = EMFILE;
-		return -1;
-	}
-
-	initListenerVtable();
-	k_poll_signal_init(&listener.acceptSig);
-	listener.pendingCount = 0;
-	listener.inUse = true;
-
-	zvfs_finalize_typed_fd(fd, &listener,
-			       reinterpret_cast<const struct fd_op_vtable *>(&listenerVtable),
-			       ZVFS_MODE_IFSOCK);
-
-	LOG_DBG("Raw listening socket created (fd %d)", fd);
-
-	return fd;
-}
-
-void RawHttpServer::rxTrampoline(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	static_cast<RawHttpServer *>(p1)->rxLoop();
-}
-
-void RawHttpServer::rxLoop()
-{
-	bool eof = false;
-
-	while (running_ && !eof) {
-		struct zsock_pollfd pfd = {
-			.fd = appFd_,
-			.events = ZSOCK_POLLIN,
-			.revents = 0,
-		};
-
-		/* The timeout is what lets stop() retire this thread; the fd
-		 * must stay open while we are parked in poll().
-		 */
-		int ret = zsock_poll(&pfd, 1, RAW_POLL_TIMEOUT_MS);
-
-		if (ret < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			LOG_DBG("poll failed (%d)", -errno);
-			break;
-		}
-
-		if (ret == 0) {
-			continue;
-		}
-
-		if ((pfd.revents & ZSOCK_POLLIN) == 0) {
-			if (pfd.revents & (ZSOCK_POLLERR | ZSOCK_POLLHUP)) {
-				break;
-			}
-			continue;
-		}
-
-		/* Short reads are normal: this delivers whatever is buffered,
-		 * never a fixed-size frame.
-		 */
-		ssize_t got = zsock_recv(appFd_, rxBuf_, sizeof(rxBuf_), 0);
-
-		if (got > 0) {
-			cb_(rxBuf_, static_cast<size_t>(got), userData_);
-			continue;
-		}
-
-		if (got == 0) {
-			LOG_DBG("HTTP server closed the connection");
-			eof = true;
-		} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-			LOG_DBG("recv failed (%d)", -errno);
-			eof = true;
-		}
-	}
-
-	/* The next input() relinks transparently. */
-	linked_ = false;
-
-	/* End-of-stream marker for the application. */
-	cb_(nullptr, 0, userData_);
-}
-
-/* Caller must hold lock_. */
-int RawHttpServer::link()
-{
-	int sv[2];
-	int ret;
-
-	/* A previous RX thread may still be unwinding. It must be fully gone
-	 * before its stack is handed to a new one.
+	/* HTTP_REQUEST puts the parser in server mode: it expects request
+	 * lines, and rolls over to the next request by itself after each
+	 * message - that is all the keep-alive handling there is to do.
 	 */
-	if (threadStarted_) {
-		running_ = false;
-		(void)k_thread_join(&thread_, K_FOREVER);
-		threadStarted_ = false;
-	}
+	http_parser_init(&_parser, HTTP_REQUEST);
 
-	/* Release the previous descriptor before allocating a new pair. Without
-	 * this a relink leaks both the fd and its 2 KiB spair block, and with a
-	 * tight CONFIG_NET_SOCKETPAIR_MAX the very first relink fails outright.
+	/* The parser carries this pointer into every static callback, which is
+	 * how they find their way back to the instance.
 	 */
-	if (appFd_ >= 0) {
-		(void)zsock_close(appFd_);
-		appFd_ = -1;
-	}
-
-	ret = zsock_socketpair(NET_AF_UNIX, NET_SOCK_STREAM, 0, sv);
-	if (ret < 0) {
-		return -errno;
-	}
-
-	/*
-	 * Our end must be non-blocking. Every zsock_*() call holds a per-fd
-	 * mutex for its whole duration (VTABLE_CALL in subsys/net/lib/sockets/
-	 * sockets.c), so a blocking recv() parked on this descriptor would lock
-	 * out send() on the same descriptor from any other thread - a hard
-	 * deadlock as soon as one connection serves more than one request.
-	 * With O_NONBLOCK nothing blocks inside the mutex, and poll() - which
-	 * does not hold it while waiting - provides the blocking instead.
-	 *
-	 * The server's end stays blocking: that is what its own code expects.
-	 */
-	if (zsock_fcntl(sv[0], ZVFS_F_SETFL, ZVFS_O_NONBLOCK) < 0) {
-		ret = -errno;
-		(void)zsock_close(sv[0]);
-		(void)zsock_close(sv[1]);
-		return ret;
-	}
-
-	/* sv[1] becomes the HTTP server's client socket, sv[0] stays with us. */
-	ret = listenerPush(sv[1]);
-	if (ret < 0) {
-		(void)zsock_close(sv[0]);
-		(void)zsock_close(sv[1]);
-		return ret;
-	}
-
-	appFd_ = sv[0];
-	linked_ = true;
-	running_ = true;
-
-	k_thread_create(&thread_, raw_rx_stack, K_THREAD_STACK_SIZEOF(raw_rx_stack),
-			rxTrampoline, this, nullptr, nullptr, RAW_RX_PRIORITY, 0, K_NO_WAIT);
-	(void)k_thread_name_set(&thread_, "raw_rx");
-	threadStarted_ = true;
-
-	return 0;
-}
-
-int RawHttpServer::start()
-{
-	int ret;
-
-	if (cb_ == nullptr) {
-		return -EINVAL;
-	}
-
-	if (started_) {
-		return 0;
-	}
-
-	if (instance != nullptr) {
-		LOG_ERR("Another RawHttpServer is already running");
-		return -EEXIST;
-	}
-
-	ret = http_server_start();
-	if (ret < 0 && ret != -EALREADY) {
-		LOG_ERR("Cannot start the HTTP server (%d)", ret);
-		return ret;
-	}
-
-	k_mutex_init(&lock_);
-	instance = this;
-	started_ = true;
-
-	/* Let the server thread reach its poll() and create the listening
-	 * socket before queueing a connection onto it.
-	 */
-	k_sleep(K_MSEC(100));
-
-	k_mutex_lock(&lock_, K_FOREVER);
-	ret = link();
-	k_mutex_unlock(&lock_);
-
-	if (ret < 0) {
-		LOG_ERR("Cannot establish the connection (%d)", ret);
-		instance = nullptr;
-		started_ = false;
-		return ret;
-	}
-
-	return 0;
+	_parser.data = this;
 }
 
 int RawHttpServer::input(const void *buffer, size_t size)
 {
-	const uint8_t *ptr = static_cast<const uint8_t *>(buffer);
-	k_timepoint_t deadline = sys_timepoint_calc(K_MSEC(RAW_TX_TIMEOUT_MS));
-	bool retried = false;
-	int ret = 0;
-
-	k_mutex_lock(&lock_, K_FOREVER);
-
-	/* Checked under the lock: otherwise a concurrent stop() could complete
-	 * between the test and the relink below, leaving a running RX thread
-	 * and two descriptors that no later stop() would ever reclaim.
-	 */
-	if (!started_) {
-		k_mutex_unlock(&lock_);
-		return -ENOTCONN;
+	if (buffer == nullptr || _cb == nullptr) {
+		return -EINVAL;
 	}
 
-	/* The server hangs up on a malformed request, and on its inactivity
-	 * timeout where the transport supports shutdown(). Relink so the link
-	 * keeps serving instead of going dead for good.
+	k_mutex_lock(&_lock, K_FOREVER);
+
+	/* Everything happens inside this call: the parser walks the buffer and
+	 * fires the on_*() callbacks below, which do the file I/O and hand the
+	 * response to the output callback. The buffer may hold a fragment of a
+	 * request or several whole ones - the parser keeps its own position
+	 * across calls, so neither case needs any handling here.
 	 */
-	if (!linked_) {
-		LOG_INF("Reconnecting to the HTTP server");
-		ret = link();
-		if (ret < 0) {
-			LOG_ERR("Relink failed (%d)", ret);
-			goto out;
-		}
+	size_t parsed = http_parser_execute(&_parser, &_settings,
+					    static_cast<const char *>(buffer), size);
+
+	/* parsed < size means the parser stopped mid-buffer on garbage. An
+	 * upgrade request (e.g. Websocket) stops it without an error; this
+	 * server does not speak anything but plain HTTP/1.1, so both cases get
+	 * the same treatment: answer 400, drop the rest of the buffer, and
+	 * re-init the parser so the next buffer starts a fresh request.
+	 */
+	if (parsed != size || _parser.upgrade || HTTP_PARSER_ERRNO(&_parser) != HPE_OK) {
+		LOG_WRN("Malformed request dropped (%s)",
+			http_errno_name(HTTP_PARSER_ERRNO(&_parser)));
+
+		respond(400, 0);
+		reset_request();
+		http_parser_init(&_parser, HTTP_REQUEST);
 	}
 
-	while (size > 0) {
-		ssize_t sent = zsock_send(appFd_, ptr, size, 0);
+	k_mutex_unlock(&_lock);
 
-		if (sent > 0) {
-			ptr += sent;
-			size -= sent;
-			continue;
-		}
+	return 0;
+}
 
-		if (sent < 0 && (errno == EPIPE || errno == ECONNRESET)) {
-			/*
-			 * The server hung up but the RX thread has not noticed
-			 * yet, so linked_ was still set when we started. Relink
-			 * and deliver this buffer again - but only if none of
-			 * it went out, otherwise the request would straddle two
-			 * connections and arrive as garbage on both.
-			 */
-			if (retried || ptr != static_cast<const uint8_t *>(buffer)) {
-				ret = -errno;
-				goto out;
-			}
+int RawHttpServer::on_url(struct http_parser *parser, const char *at, size_t length)
+{
+	RawHttpServer *self = static_cast<RawHttpServer *>(parser->data);
 
-			retried = true;
-			linked_ = false;
-			LOG_INF("Peer hung up mid-send, reconnecting");
-
-			ret = link();
-			if (ret < 0) {
-				goto out;
-			}
-
-			continue;
-		}
-
-		if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-			ret = -errno;
-			goto out;
-		}
-
-		/*
-		 * The server has not drained its side yet. Retry after a short
-		 * sleep.
-		 *
-		 * Deliberately NOT poll(POLLOUT): socketpair's POLLOUT
-		 * poll-prepare takes the peer's semaphore with K_FOREVER
-		 * (zsock_poll_prepare_ctx() in subsys/net/lib/sockets/
-		 * socketpair.c) while zvfs_poll_internal() holds this
-		 * descriptor's per-fd mutex. If the server is itself parked in a
-		 * blocking write - which keeps that same peer semaphore - the RX
-		 * thread can no longer take the per-fd mutex to drain us, and
-		 * all three deadlock. A non-blocking send() cannot: it gives up
-		 * with EAGAIN rather than waiting on the peer semaphore.
+	/* The URL arrives in as many fragments as input() buffers happened to
+	 * split it into, so it has to be accumulated - it cannot be used until
+	 * the head is complete anyway.
+	 */
+	if (self->_url_len + length >= sizeof(self->_url)) {
+		/* Poison the request rather than truncating: a truncated name
+		 * would silently address the wrong file.
 		 */
-		if (!running_) {
-			ret = -ECONNRESET;
-			goto out;
-		}
-
-		if (sys_timepoint_expired(deadline)) {
-			ret = -ETIMEDOUT;
-			goto out;
-		}
-
-		k_sleep(K_MSEC(RAW_TX_RETRY_MS));
+		self->_error_status = 414;
+		return 0;
 	}
 
-out:
-	k_mutex_unlock(&lock_);
+	memcpy(self->_url + self->_url_len, at, length);
+	self->_url_len += length;
+	self->_url[self->_url_len] = '\0';
 
-	return ret;
+	return 0;
 }
 
-void RawHttpServer::stop()
+int RawHttpServer::on_headers_complete(struct http_parser *parser)
 {
-	if (!started_) {
-		return;
-	}
+	RawHttpServer *self = static_cast<RawHttpServer *>(parser->data);
 
-	k_mutex_lock(&lock_, K_FOREVER);
-
-	started_ = false;
-	linked_ = false;
-
-	/* Retire the RX thread first: it is parked in poll() on appFd_, and the
-	 * descriptor must stay valid until it is gone. It notices within one
-	 * poll timeout.
+	/* The URL was too long; there is nothing sane to open. The body, if
+	 * any, still has to be parsed out of the stream, so no early answer.
 	 */
-	running_ = false;
-
-	if (threadStarted_) {
-		(void)k_thread_join(&thread_, K_FOREVER);
-		threadStarted_ = false;
+	if (self->_error_status != 0) {
+		return 0;
 	}
 
-	if (appFd_ >= 0) {
-		(void)zsock_close(appFd_);
-		appFd_ = -1;
+	switch (parser->method) {
+	case HTTP_GET:
+		/* Downloads carry no body; everything happens in
+		 * on_message_complete(). Opening the file this early would
+		 * only mean holding it open for no reason.
+		 */
+		return 0;
+
+	case HTTP_PUT:
+	case HTTP_POST: {
+		/* Uploads are the opposite: the destination must be open
+		 * before the first body fragment arrives, because fragments
+		 * are written straight to the file - the class never buffers
+		 * the body, which is what makes upload size unbounded.
+		 */
+		char path[RAW_HTTP_PATH_MAX];
+		int ret = self->build_path(path, sizeof(path));
+
+		if (ret < 0) {
+			self->_error_status = 404;
+			return 0;
+		}
+
+		fs_file_t_init(&self->_file);
+		ret = fs_open(&self->_file, path, FS_O_CREATE | FS_O_WRITE);
+
+		if (ret == 0) {
+			/* FS_O_CREATE does not truncate an existing file, and
+			 * a shorter re-upload must not leave the old tail
+			 * behind.
+			 */
+			ret = fs_truncate(&self->_file, 0);
+			if (ret < 0) {
+				(void)fs_close(&self->_file);
+			}
+		}
+
+		if (ret < 0) {
+			LOG_ERR("Cannot open %s for upload (%d)", path, ret);
+			self->_error_status = 500;
+			return 0;
+		}
+
+		LOG_INF("%s %s", http_method_str((enum http_method)parser->method), path);
+		self->_file_open = true;
+		return 0;
 	}
 
-	listenerDrainPending();
-
-	instance = nullptr;
-
-	k_mutex_unlock(&lock_);
+	default:
+		/* DELETE, HEAD and friends are not served. The 405 is emitted
+		 * in on_message_complete(), like every other answer.
+		 */
+		self->_error_status = 405;
+		return 0;
+	}
 }
 
-RawHttpServer::~RawHttpServer()
+int RawHttpServer::on_body(struct http_parser *parser, const char *at, size_t length)
 {
-	stop();
+	RawHttpServer *self = static_cast<RawHttpServer *>(parser->data);
+
+	/* No file means the request already failed. The remaining fragments
+	 * still stream through here - they have to be parsed to find the end
+	 * of the message - but they go nowhere.
+	 */
+	if (!self->_file_open) {
+		return 0;
+	}
+
+	/* @p at points into the caller's input() buffer: the body goes from
+	 * the wire to the filesystem with no copy in between.
+	 */
+	ssize_t written = fs_write(&self->_file, at, length);
+
+	if (written < 0 || (size_t)written != length) {
+		/* Typically -ENOSPC. Give up on the file but keep parsing, so
+		 * the stream stays in sync and the client gets a clean 500
+		 * instead of a desynchronised parser.
+		 */
+		LOG_ERR("fs_write failed (%d)", (int)written);
+		(void)fs_close(&self->_file);
+		self->_file_open = false;
+		self->_error_status = 500;
+	}
+
+	return 0;
 }
 
-/*
- * ---------------------------------------------------------------------------
- * File transfers
- * ---------------------------------------------------------------------------
- */
+int RawHttpServer::on_message_complete(struct http_parser *parser)
+{
+	RawHttpServer *self = static_cast<RawHttpServer *>(parser->data);
 
-int RawHttpServer::buildPath(const char *url, char *out, size_t out_size)
+	/* The whole request has been parsed - this is the one place answers
+	 * are sent from, so every request produces exactly one response, in
+	 * order, even when several arrived in a single input() buffer.
+	 */
+	if (self->_error_status != 0) {
+		self->respond(self->_error_status, 0);
+	} else if (parser->method == HTTP_GET) {
+		self->send_file();
+	} else {
+		/* A PUT or POST whose body is fully on disk. */
+		(void)fs_close(&self->_file);
+		self->_file_open = false;
+		self->respond(201, 0);
+	}
+
+	/* Clear the per-request state; the parser rolls over to the next
+	 * request in the stream by itself.
+	 */
+	self->reset_request();
+
+	return 0;
+}
+
+int RawHttpServer::build_path(char *out, size_t out_size) const
 {
 	const size_t prefix_len = sizeof(RAW_HTTP_FILES_PREFIX) - 1;
-	const char *name;
-	const char *query;
-	size_t name_len;
 
-	if (strncmp(url, RAW_HTTP_FILES_PREFIX, prefix_len) != 0) {
+	/* Anything outside /files/ simply does not exist here. */
+	if (strncmp(_url, RAW_HTTP_FILES_PREFIX, prefix_len) != 0) {
 		return -ENOENT;
 	}
 
-	name = url + prefix_len;
+	const char *name = _url + prefix_len;
 
 	/* A query string is not part of the filename. */
-	query = strchr(name, '?');
-	name_len = (query != nullptr) ? (size_t)(query - name) : strlen(name);
+	const char *query = strchr(name, '?');
+	size_t name_len = (query != nullptr) ? (size_t)(query - name) : strlen(name);
 
 	if (name_len == 0) {
 		return -ENOENT;
 	}
 
-	if (snprintk(out, out_size, "%s/%.*s", fsRoot_, (int)name_len, name) >= (int)out_size) {
+	/* Nothing above the root is reachable. */
+	if (strstr(name, "..") != nullptr) {
+		return -ENOENT;
+	}
+
+	/* snprintk returns what it would have written, so >= out_size means
+	 * the path got cut - reject it rather than touching the wrong file.
+	 */
+	if (snprintk(out, out_size, "%s/%.*s", _fs_root, (int)name_len, name) >= (int)out_size) {
 		return -ENAMETOOLONG;
 	}
 
 	return 0;
 }
 
-void RawHttpServer::closeTransfer()
+void RawHttpServer::send_file()
 {
-	if (fileOpen_) {
-		(void)fs_close(&file_);
-		fileOpen_ = false;
-	}
-}
+	char path[RAW_HTTP_PATH_MAX];
+	struct fs_dirent entry;
+	int ret = build_path(path, sizeof(path));
 
-int RawHttpServer::handleDownload(struct http_client_ctx *client,
-				  struct http_response_ctx *response_ctx)
-{
-	ssize_t got;
-
-	if (!fileOpen_) {
-		char path[RAW_HTTP_PATH_MAX];
-		int ret = buildPath(reinterpret_cast<const char *>(client->url_buffer), path,
-				    sizeof(path));
-
-		if (ret == 0) {
-			fs_file_t_init(&file_);
-			ret = fs_open(&file_, path, FS_O_READ);
-		}
-
-		if (ret < 0) {
-			LOG_INF("GET %s -> %d", (const char *)client->url_buffer, ret);
-			response_ctx->status = HTTP_404_NOT_FOUND;
-			response_ctx->final_chunk = true;
-			return 0;
-		}
-
-		LOG_INF("GET %s", path);
-		fileOpen_ = true;
-		response_ctx->status = HTTP_200_OK;
+	/* Stat before open: the size goes into the Content-Length header,
+	 * which must be on the wire before the first body byte.
+	 */
+	if (ret == 0) {
+		ret = fs_stat(path, &entry);
 	}
 
-	got = fs_read(&file_, fileBuf_, sizeof(fileBuf_));
-	if (got < 0) {
-		LOG_ERR("fs_read failed (%d)", (int)got);
-		closeTransfer();
-		return (int)got;
+	if (ret == 0) {
+		fs_file_t_init(&_file);
+		ret = fs_open(&_file, path, FS_O_READ);
 	}
 
-	if (got == 0) {
-		/* End of file: nothing more to send. */
-		closeTransfer();
-		response_ctx->final_chunk = true;
-		return 0;
+	/* Whatever failed - bad prefix, no such file, unreadable - the client
+	 * only needs to know the file is not there.
+	 */
+	if (ret < 0) {
+		LOG_INF("GET %s -> %d", _url, ret);
+		respond(404, 0);
+		return;
 	}
 
-	response_ctx->body = fileBuf_;
-	response_ctx->body_len = (size_t)got;
+	LOG_INF("GET %s", path);
+	_file_open = true;
+	respond(200, entry.size);
 
-	return 0;
-}
+	/* Stream the body one chunk at a time, so file size is bounded by the
+	 * filesystem and not by RAM. Each chunk goes straight to the output
+	 * callback; the caller's link provides any pacing needed.
+	 */
+	for (;;) {
+		ssize_t got = fs_read(&_file, _file_buf, sizeof(_file_buf));
 
-int RawHttpServer::handleUpload(struct http_client_ctx *client,
-				enum http_transaction_status status,
-				const struct http_request_ctx *request_ctx,
-				struct http_response_ctx *response_ctx)
-{
-	if (!fileOpen_) {
-		char path[RAW_HTTP_PATH_MAX];
-		int ret = buildPath(reinterpret_cast<const char *>(client->url_buffer), path,
-				    sizeof(path));
-
-		if (ret == 0) {
-			fs_file_t_init(&file_);
-			ret = fs_open(&file_, path, FS_O_CREATE | FS_O_WRITE);
-		}
-
-		if (ret == 0) {
-			/* FS_O_CREATE does not truncate an existing file. */
-			ret = fs_truncate(&file_, 0);
-			if (ret < 0) {
-				(void)fs_close(&file_);
+		if (got <= 0) {
+			/* A read error mid-stream cannot be signalled any
+			 * more - the head already promised entry.size bytes.
+			 * All there is to do is stop and log.
+			 */
+			if (got < 0) {
+				LOG_ERR("fs_read failed (%d)", (int)got);
 			}
+			break;
 		}
 
-		if (ret < 0) {
-			LOG_ERR("upload %s -> %d", (const char *)client->url_buffer, ret);
-			response_ctx->status = HTTP_400_BAD_REQUEST;
-			response_ctx->final_chunk = true;
-			return 0;
-		}
-
-		LOG_INF("%s %s", http_method_str((enum http_method)client->method), path);
-		fileOpen_ = true;
+		send(_file_buf, (size_t)got);
 	}
 
-	if (request_ctx->data_len > 0) {
-		ssize_t written = fs_write(&file_, request_ctx->data, request_ctx->data_len);
-
-		if (written < 0 || (size_t)written != request_ctx->data_len) {
-			LOG_ERR("fs_write failed (%d)", (int)written);
-			closeTransfer();
-			response_ctx->status = HTTP_500_INTERNAL_SERVER_ERROR;
-			response_ctx->final_chunk = true;
-			return 0;
-		}
-	}
-
-	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
-		closeTransfer();
-		response_ctx->status = HTTP_201_CREATED;
-		response_ctx->final_chunk = true;
-	}
-
-	return 0;
+	(void)fs_close(&_file);
+	_file_open = false;
 }
 
-int RawHttpServer::handleFile(struct http_client_ctx *client, enum http_transaction_status status,
-			      const struct http_request_ctx *request_ctx,
-			      struct http_response_ctx *response_ctx)
+void RawHttpServer::respond(unsigned int status, size_t content_length)
 {
-	if (status == HTTP_SERVER_TRANSACTION_COMPLETE ||
-	    status == HTTP_SERVER_TRANSACTION_ABORTED) {
-		/* Terminal notifications: make sure nothing is left open. */
-		closeTransfer();
-		return 0;
-	}
+	/* The head is complete as-is: HTTP/1.1 defaults to keep-alive, and
+	 * Content-Length - zero included - tells the client exactly where
+	 * this response ends and the next may begin.
+	 */
+	char head[96];
+	int len = snprintk(head, sizeof(head), "HTTP/1.1 %u %s\r\nContent-Length: %zu\r\n\r\n",
+			   status, reason_of(status), content_length);
 
-	switch (client->method) {
-	case HTTP_GET:
-		return handleDownload(client, response_ctx);
-
-	case HTTP_PUT:
-	case HTTP_POST:
-		return handleUpload(client, status, request_ctx, response_ctx);
-
-	default:
-		response_ctx->status = HTTP_400_BAD_REQUEST;
-		response_ctx->final_chunk = true;
-		return 0;
-	}
+	send(head, (size_t)len);
 }
 
-int RawHttpServer::fileHandler(struct http_client_ctx *client, enum http_transaction_status status,
-			       const struct http_request_ctx *request_ctx,
-			       struct http_response_ctx *response_ctx, void *user_data)
+void RawHttpServer::send(const void *data, size_t len)
 {
-	RawHttpServer *self = static_cast<RawHttpServer *>(user_data);
+	_cb(static_cast<const uint8_t *>(data), len, _user_data);
+}
 
-	if (self == nullptr) {
-		return -EINVAL;
+void RawHttpServer::reset_request()
+{
+	/* Only an abandoned request still holds a file here - the normal
+	 * paths close it themselves. Closing it drops any half-written
+	 * upload's buffered tail.
+	 */
+	if (_file_open) {
+		(void)fs_close(&_file);
+		_file_open = false;
 	}
 
-	return self->handleFile(client, status, request_ctx, response_ctx);
+	_url_len = 0;
+	_url[0] = '\0';
+	_error_status = 0;
 }

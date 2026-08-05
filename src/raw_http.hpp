@@ -6,27 +6,26 @@
 
 /**
  * @file
- * @brief Raw (network-less) front end for the Zephyr HTTP server.
+ * @brief A file server for HTTP/1.1 over bare data buffers.
  *
- * The HTTP server always talks to its peers through a socket, but it never
- * cares what is behind that socket. RawHttpServer exploits that: it gives the
- * stock, unmodified server a socket that is not a network socket, and exposes
- * the whole thing as two plain operations:
+ * No sockets, no L2, no IP, no TCP - the only Zephyr networking code involved
+ * is the HTTP request parser library. The whole surface is two operations:
  *
- *   - input(buffer, size) - raw bytes go into the server
- *   - the OutputCallback given to the constructor - raw bytes come back out
+ *   - input(buffer, size) - raw request bytes go in
+ *   - the OutputCallback given to the constructor - response bytes come out
  *
- * No L2 driver, no IP and no TCP is involved at any point.
+ * GET downloads a file from an already-mounted directory, PUT and POST upload
+ * one into it. Everything runs synchronously inside input(): by the time it
+ * returns, the response has been handed to the output callback.
  *
  * @code
- * static void toMyLink(const uint8_t *data, size_t len, void *user)
+ * static void to_my_link(const uint8_t *data, size_t len, void *user)
  * {
  *         my_link_write(data, len);
  * }
  *
- * static RawHttpServer server(toMyLink);
+ * static RawHttpServer server(to_my_link, "/lfs");
  *
- * server.start();
  * server.input(bytes_from_my_link, n);
  * @endcode
  */
@@ -39,204 +38,178 @@
 
 #include <zephyr/fs/fs.h>
 #include <zephyr/kernel.h>
-#include <zephyr/net/http/server.h>
-#include <zephyr/net/http/service.h>
+#include <zephyr/net/http/parser.h>
 
-/** Bytes passed to the output callback at most in one go. */
-#define RAW_HTTP_RX_BUF_SIZE 1600
-
-/** URL prefix under which files are served. Register the resource with it. */
+/** URL prefix under which files are served. */
 #define RAW_HTTP_FILES_PREFIX "/files/"
 
-/**
- * Bytes read from the filesystem per download callback.
- *
- * Pure throughput-vs-RAM tradeoff, and it costs exactly this many bytes inside
- * every RawHttpServer instance. Nothing downstream constrains it: the chunked
- * encoding re-states the length for each chunk, and a chunk larger than
- * CONFIG_NET_SOCKETPAIR_BUFFER_SIZE simply makes the server's blocking send()
- * drain in more than one go. Uploads do not use this buffer at all - they are
- * written straight from the request body, whose size the client buffer governs.
- */
-#define RAW_HTTP_FILE_CHUNK 1600
+/** Longest URL accepted, query string included. Longer ones get a 414. */
+#define RAW_HTTP_URL_MAX 160
 
-/** Longest absolute path this server will build. */
+/** Longest absolute filesystem path this server will build. */
 #define RAW_HTTP_PATH_MAX 128
 
 /**
- * @brief The Zephyr HTTP server, driven by bare data buffers.
+ * Bytes read from the filesystem per output callback during a download.
  *
- * The connection is persistent. An HTTP/1.1 request that does not carry
- * "Connection: close" leaves it open, so one connection serves requests
- * indefinitely. If the server does hang up - on a malformed request, say -
- * input() re-establishes it on a following call; see the note on input() for
- * what that costs.
+ * A pure throughput-vs-RAM tradeoff costing exactly this many bytes per
+ * instance. Uploads do not use this buffer: the request body is written to the
+ * file straight from the caller's input buffer.
+ */
+#define RAW_HTTP_FILE_CHUNK 1600
+
+/**
+ * @brief Serve files over HTTP/1.1, on buffers instead of a connection.
  *
- * @note One instance at a time. The listening socket is a process-wide
- *       singleton, so a second concurrent start() fails with -EEXIST. This is
- *       a single-client design by construction.
+ * The "connection" is whatever byte pipe the caller owns, so it never opens or
+ * closes: every request is answered and the parser waits for the next one.
+ * A malformed request gets a 400 and the parser resets, ready for the request
+ * after it - nothing is ever lost beyond the malformed bytes themselves.
+ *
+ * Thread-safe: input() serialises callers with a mutex. Single-client by
+ * construction - one byte stream, one request at a time.
  */
 class RawHttpServer {
 public:
 	/**
-	 * @brief Raw bytes produced by the HTTP server.
+	 * @brief Response bytes produced by the server.
 	 *
-	 * Registered through the constructor. Write them onto your real link -
-	 * a UART, a USB endpoint, shared memory, a test harness.
+	 * Invoked from inside input(), on the caller's thread. Write the bytes
+	 * onto your real link - a UART, a USB endpoint, shared memory, a test
+	 * harness.
 	 *
-	 * @note Invoked from the RX thread, never from the HTTP server thread.
-	 *       The payload is a byte stream, so one HTTP response may arrive
-	 *       over several calls, and one call may carry the tail of one
-	 *       response and the head of the next. Never assume a fixed size:
-	 *       @p len is whatever happened to be available.
+	 * @note The payload is a byte stream: one response may arrive over
+	 *       several calls. Never assume a fixed size - @p len is whatever
+	 *       the server produced in one go.
 	 *
-	 * @param data Bytes from the server, or nullptr when the server hung up.
-	 * @param len Valid bytes in @p data, 0 when the server hung up.
+	 * @param data Bytes to transmit. Never nullptr.
+	 * @param len Valid bytes in @p data. Never 0.
 	 * @param user_data The pointer handed to the constructor.
 	 */
 	using OutputCallback = void (*)(const uint8_t *data, size_t len, void *user_data);
 
 	/**
-	 * @brief Construct the front end.
+	 * @brief Construct the server. There is nothing else to start.
 	 *
-	 * Does no work beyond storing its arguments, so an instance is safe at
-	 * namespace scope. Call start() to bring it up.
-	 *
-	 * @param cb Callback receiving the server's output. Must not be nullptr.
+	 * @param cb Callback receiving response bytes. Must not be nullptr.
+	 * @param fs_root Already-mounted directory that files are served from
+	 *                and uploaded into, e.g. "/lfs". Not created or mounted
+	 *                here.
 	 * @param user_data Opaque pointer forwarded to @p cb.
 	 */
-	/**
-	 * @param cb Callback receiving the server's output. Must not be nullptr.
-	 * @param fs_root Already-mounted directory that files are served from and
-	 *                uploaded into, e.g. "/lfs". Not created or mounted here.
-	 * @param user_data Opaque pointer forwarded to @p cb.
-	 */
-	explicit RawHttpServer(OutputCallback cb, const char *fs_root, void *user_data = nullptr)
-		: cb_(cb), userData_(user_data), fsRoot_(fs_root)
-	{
-	}
-
-	~RawHttpServer();
+	RawHttpServer(OutputCallback cb, const char *fs_root, void *user_data = nullptr);
 
 	RawHttpServer(const RawHttpServer &) = delete;
 	RawHttpServer &operator=(const RawHttpServer &) = delete;
 
 	/**
-	 * @brief Start the HTTP server and establish the connection.
+	 * @brief Hand a buffer of raw request bytes to the server.
 	 *
-	 * @return 0 on success, -EEXIST if an instance is already running,
-	 *         another negative errno otherwise.
-	 */
-	int start();
-
-	/**
-	 * @brief Hand a buffer of raw request bytes to the HTTP server.
+	 * The buffer does not have to hold a whole request and it may span
+	 * several requests: the parser consumes a byte stream, not messages.
+	 * Responses are emitted through the output callback before this
+	 * returns, so the call blocks for the duration of any file I/O.
 	 *
-	 * The buffer does not have to hold a whole request, and it may span
-	 * several requests: the server parses a byte stream, not messages.
+	 * A malformed request is answered with a 400 and the rest of the buffer
+	 * is discarded; the next call starts a fresh request. Never call this
+	 * from an ISR.
 	 *
-	 * @note Recovery is not seamless. The server closes on a malformed
-	 *       request, and the buffer that races that close is lost - measured
-	 *       behaviour is that one request goes missing before the relink
-	 *       takes effect; the one after it succeeds. A buffer that is only
-	 *       partially delivered is dropped rather than straddling two
-	 *       connections, which would arrive as garbage on both.
-	 *
-	 * Blocks until every byte has been handed over, which happens when the
-	 * server is slower than the caller. Never call it from the output
-	 * callback, and never from an ISR.
-	 *
-	 * @return 0 on success, negative errno otherwise.
+	 * @return 0 on success (including handled bad requests),
+	 *         -EINVAL on a nullptr buffer.
 	 */
 	int input(const void *buffer, size_t size);
 
-	/** @brief Whether the connection to the server is currently up. */
-	bool isConnected() const
-	{
-		return linked_;
-	}
-
-	/** @brief Tear the connection down. start() may be called again after. */
-	void stop();
-
-	/**
-	 * @brief Listening socket factory, for http_service_config::socket_create.
-	 *
-	 * Pass this to the HTTP_SERVICE_DEFINE() that declares your resources:
-	 *
-	 * @code
-	 * static const struct http_service_config cfg = {
-	 *         .socket_create = RawHttpServer::socketCreate,
-	 * };
-	 * @endcode
-	 */
-	static int socketCreate(const struct http_service_desc *svc, int af, int proto);
-
-	/**
-	 * @brief Resource callback serving files out of, and into, the fs root.
-	 *
-	 * GET streams a file back; PUT and POST write the request body to one.
-	 * Register it on RAW_HTTP_FILES_PREFIX "*" with this instance as the
-	 * resource's user_data:
-	 *
-	 * @code
-	 * static struct http_resource_detail_dynamic files = {
-	 *         .common = { .bitmask_of_supported_http_methods =
-	 *                             BIT(HTTP_GET) | BIT(HTTP_PUT) | BIT(HTTP_POST),
-	 *                     .type = HTTP_RESOURCE_TYPE_DYNAMIC, ... },
-	 *         .cb = RawHttpServer::fileHandler,
-	 * };
-	 * files.user_data = &server;      // at runtime, before start()
-	 * @endcode
-	 *
-	 * @note Responses are chunked: a dynamic resource has no Content-Length.
-	 * @note One transfer at a time, which the server's per-resource holder
-	 *       already enforces for a single client.
-	 */
-	static int fileHandler(struct http_client_ctx *client, enum http_transaction_status status,
-			       const struct http_request_ctx *request_ctx,
-			       struct http_response_ctx *response_ctx, void *user_data);
-
 	/** @brief The filesystem root passed to the constructor. */
-	const char *fsRoot() const
+	const char *fs_root() const
 	{
-		return fsRoot_;
+		return _fs_root;
 	}
 
 private:
-	int link();
-	static void rxTrampoline(void *p1, void *p2, void *p3);
-	void rxLoop();
-
-	int handleFile(struct http_client_ctx *client, enum http_transaction_status status,
-		       const struct http_request_ctx *request_ctx,
-		       struct http_response_ctx *response_ctx);
-	int handleDownload(struct http_client_ctx *client, struct http_response_ctx *response_ctx);
-	int handleUpload(struct http_client_ctx *client, enum http_transaction_status status,
-			 const struct http_request_ctx *request_ctx,
-			 struct http_response_ctx *response_ctx);
-	int buildPath(const char *url, char *out, size_t out_size);
-	void closeTransfer();
-
-	OutputCallback cb_;
-	void *userData_;
-	const char *fsRoot_;
-
-	/* In-flight file transfer. Single-client by design, so one is enough.
-	 * Separate from rxBuf_ on purpose: the RX thread may be draining a
-	 * response into the output callback while the server thread fills this.
+	/**
+	 * @brief Parser callback: accumulate the (possibly split) URL.
+	 *
+	 * The parser hands the URL over in as many pieces as the transport
+	 * produced; this appends each piece to _url. Overflow marks the
+	 * request as failed with a 414 rather than truncating silently.
 	 */
-	struct fs_file_t file_ {};
-	bool fileOpen_{false};
-	uint8_t fileBuf_[RAW_HTTP_FILE_CHUNK]{};
-	int appFd_{-1};
-	struct k_mutex lock_ {};
-	struct k_thread thread_ {};
-	bool started_{false};
-	volatile bool linked_{false};
-	bool threadStarted_{false};
-	volatile bool running_{false};
-	uint8_t rxBuf_[RAW_HTTP_RX_BUF_SIZE]{};
+	static int on_url(struct http_parser *parser, const char *at, size_t length);
+
+	/**
+	 * @brief Parser callback: the request head is complete.
+	 *
+	 * For PUT and POST this opens the destination file, so that body
+	 * fragments can be written straight through as they arrive. Any other
+	 * method than GET/PUT/POST fails the request with a 405.
+	 */
+	static int on_headers_complete(struct http_parser *parser);
+
+	/**
+	 * @brief Parser callback: one fragment of the request body.
+	 *
+	 * Appends the fragment to the file opened by on_headers_complete().
+	 * A write failure closes the file and fails the request with a 500;
+	 * the rest of the body is then parsed but ignored.
+	 */
+	static int on_body(struct http_parser *parser, const char *at, size_t length);
+
+	/**
+	 * @brief Parser callback: the request is complete - answer it.
+	 *
+	 * Emits the response for the collected request state: the recorded
+	 * error, a streamed download for GET, or a 201 for a finished upload.
+	 * Afterwards the per-request state is reset for the next request.
+	 */
+	static int on_message_complete(struct http_parser *parser);
+
+	/**
+	 * @brief Map the request URL to an absolute path under the fs root.
+	 *
+	 * Strips the query string, requires the RAW_HTTP_FILES_PREFIX, and
+	 * rejects ".." so nothing outside the root is reachable.
+	 *
+	 * @return 0 on success, -ENOENT for a URL outside the prefix or an
+	 *         empty/traversing name, -ENAMETOOLONG if it does not fit.
+	 */
+	int build_path(char *out, size_t out_size) const;
+
+	/**
+	 * @brief Serve a GET: open the file, send the head, stream the body.
+	 *
+	 * The size comes from fs_stat(), so the response carries a plain
+	 * Content-Length - no chunked encoding. A file that cannot be opened
+	 * or stat'd is a 404.
+	 */
+	void send_file();
+
+	/** @brief Emit a response head, and with it any zero-length response. */
+	void respond(unsigned int status, size_t content_length);
+
+	/** @brief Push bytes to the output callback. */
+	void send(const void *data, size_t len);
+
+	/** @brief Close any open file and clear the per-request state. */
+	void reset_request();
+
+	/** The parser callbacks, shared by every instance. */
+	static const struct http_parser_settings _settings;
+
+	OutputCallback _cb;
+	void *_user_data;
+	const char *_fs_root;
+
+	struct http_parser _parser {};
+	struct k_mutex _lock {};
+
+	/* Per-request state, cleared by reset_request(). */
+	char _url[RAW_HTTP_URL_MAX]{};
+	size_t _url_len{0};
+	struct fs_file_t _file {};
+	bool _file_open{false};
+	/** Nonzero once the request has failed; the status to answer with. */
+	unsigned int _error_status{0};
+
+	uint8_t _file_buf[RAW_HTTP_FILE_CHUNK]{};
 };
 
 #endif /* RAW_HTTP_HPP_ */
