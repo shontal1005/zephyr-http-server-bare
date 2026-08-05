@@ -187,6 +187,27 @@ pseudoterminal it prints instead of a real device.
 pyserial is used when present and is required for `--baud`; without it the
 device is opened raw, which is all a pty needs.
 
+## Python client
+
+[`client/raw_http_client.py`](client/raw_http_client.py) is the host-side
+mirror of the server: `RawHttpClient` speaks the HTTP but knows nothing about
+the link — subclasses plug in the transport by overriding `send()` and
+`receive()`, just as the server delegates its bytes to a callback.
+`SerialRawHttpClient` is the UART implementation (pyserial when present, a raw
+fd otherwise — all a pty needs):
+
+```python
+from raw_http_client import SerialRawHttpClient
+
+with SerialRawHttpClient("/dev/pts/9") as client:
+    client.drain()                              # boot self-test replies
+    client.download("hello.txt", "hello.txt")
+    client.upload("firmware.bin", "fw.bin")
+```
+
+The file doubles as a tool:
+`./client/raw_http_client.py /dev/ttyUSB0 download report.bin report.bin`.
+
 ## Configuration notes
 
 `RAW_HTTP_SERVER` **selects** `NETWORKING` for one reason only: the parser
