@@ -13,23 +13,40 @@ an already-mounted directory, PUT and POST upload one into it.
 ## The API
 
 One standalone class, [`include/raw_http_server.hpp`](include/raw_http_server.hpp). The output
-callback is registered in the constructor; input is a buffer and a size. There
-is nothing to start:
+callback is registered in the constructor; input is a `net_buf` packet of raw
+request bytes. Constructing the server starts its thread — there is nothing
+else to start:
 
 ```cpp
-static void to_my_link(const uint8_t *data, size_t len, void *user)
+NET_BUF_POOL_DEFINE(my_pool, 8, 1024, 0, NULL);
+
+static void to_my_link(struct net_buf *packet, size_t len, void *user)
 {
-        my_link_write(data, len);        // bytes out of the server
+        my_link_write(packet->data, len);        // bytes out of the server
 }
 
 // second argument is the already-mounted directory files live in
 static RawHttpServer server(to_my_link, "/lfs");
 
-server.input(bytes_from_my_link, n);     // bytes into the server
+struct net_buf *packet = net_buf_alloc(&my_pool, K_FOREVER);
+net_buf_add_mem(packet, bytes_from_my_link, n);
+server.enqueue_packet(packet);           // bytes into the server
 ```
 
-That is the whole surface. Everything happens synchronously inside `input()`:
-by the time it returns, the response has been handed to the output callback.
+That is the whole surface. `enqueue_packet()` only queues — safe from any
+thread or ISR — and the server's own thread does everything else: it parses
+each packet in arrival order and emits the response through the output callback
+before taking the next, so requests are never handled in parallel. A packet
+arriving while a response is still streaming simply waits in the queue.
+
+The response is staged in the request's own packet: the `net_buf` that
+completed a request is cleared and refilled for every output callback of that
+response, then released. The callback must therefore copy or transmit the
+bytes before it returns. Because the server owns each packet from
+`enqueue_packet()` on, buffers must hold at least
+`RawHttpServer::response_head_max` (96) bytes so a response head can be staged
+in place.
+
 `RawHttpServer` knows nothing about UARTs —
 [`src/uart_bridge.cpp`](src/uart_bridge.cpp) is a separate class that wires the
 two together, and is easy to swap for a USB endpoint, shared memory, or a test
@@ -53,16 +70,18 @@ or list it as a project in your west manifest. Then in `prj.conf`:
 CONFIG_RAW_HTTP_SERVER=y
 ```
 
-`RAW_HTTP_SERVER` selects `CPP`, `FILE_SYSTEM`, `HTTP_PARSER` and `NETWORKING`
-(the last one exists only to reach the parser's Kconfig menu — see the
-configuration notes). Everything tunable is a Kconfig option:
+`RAW_HTTP_SERVER` selects `CPP`, `FILE_SYSTEM`, `HTTP_PARSER`, `NET_BUF` and
+`NETWORKING` (the last one exists only to reach the parser's Kconfig menu — see
+the configuration notes). Everything tunable is a Kconfig option:
 
 | Option | Default | |
 |---|---|---|
 | `CONFIG_RAW_HTTP_FILES_PREFIX` | `/files/` | URL prefix files are served under |
 | `CONFIG_RAW_HTTP_URL_MAX` | 160 | longest accepted URL (414 beyond) |
 | `CONFIG_RAW_HTTP_PATH_MAX` | 256 | longest filesystem path built |
-| `CONFIG_RAW_HTTP_FILE_CHUNK` | 1600 | download buffer, bytes per instance |
+| `CONFIG_RAW_HTTP_FILE_CHUNK` | 1600 | download bytes read per output callback |
+| `CONFIG_RAW_HTTP_THREAD_STACK_SIZE` | 4096 | the server thread's stack |
+| `CONFIG_RAW_HTTP_THREAD_PRIORITY` | 9 | the server thread's priority |
 | `CONFIG_RAW_HTTP_LOG_LEVEL` | inf | standard per-module log level |
 
 ## Files
@@ -76,21 +95,26 @@ PUT  /files/report.bin      upload the request body to that path
 POST /files/report.bin      same as PUT
 ```
 
-Downloads stream through a `CONFIG_RAW_HTTP_FILE_CHUNK` buffer (1600 bytes by default), so file
-size is not bounded by RAM; the size comes from `fs_stat()`, so responses carry
-a plain `Content-Length` — no chunked encoding, and a progress bar knows the
-total up front. Uploads never touch that buffer: body fragments are written to
-the file straight out of the caller's input buffer as the parser delivers them,
-so they are not bounded either. A missing file returns 404, a `..` in the name
+Downloads stream in chunks staged in the request's own packet — the smaller of
+the packet buffer's capacity and `CONFIG_RAW_HTTP_FILE_CHUNK` per callback — so
+file size is not bounded by RAM; the size comes from `fs_stat()`, so responses
+carry a plain `Content-Length` — no chunked encoding, and a progress bar knows
+the total up front. Uploads work the same way in reverse: body fragments are
+written to the file straight out of the request packet as the parser delivers
+them, so they are not bounded either. A missing file returns 404, a `..` in the name
 is rejected, and the stream just keeps serving.
 
 ## No connection to lose
 
 HTTP/1.1 keep-alive falls out of the design instead of being engineered in:
 there is no connection object anywhere, just a resumable parser on a byte
-stream. Requests may be split across any number of `input()` calls, and one
-call may carry several requests. A malformed request is answered with a 400 and
-the parser resets — nothing is lost beyond the malformed bytes themselves.
+stream. Requests may be split across any number of packets. A malformed request
+is answered with a 400 and the parser resets — nothing is lost beyond the
+malformed bytes themselves. The one thing a packet must not carry is a
+pipelined *next* request behind a complete one: the buffer is reused for the
+response, so those bytes are dropped (loudly). A client that waits for each
+response — which this request/response transport implies anyway — never hits
+this.
 
 ## How it works
 
@@ -101,18 +125,25 @@ work:
 - `on_url` accumulates the (possibly split) URL
 - `on_headers_complete` opens the destination file for PUT/POST
 - `on_body` appends each body fragment to that file
-- `on_message_complete` answers: streams the file back for GET, closes and
-  201s for uploads, or emits the recorded error status
+- `on_message_complete` pauses the parser — the answer is deferred until
+  `http_parser_execute()` has returned, because the response is staged in the
+  very packet the parser is still reading
 
-There are no sockets, no threads and no state machine beyond the parser's own.
-The class owns one mutex (so several threads may call `input()`), one file
-handle and one download buffer.
+The server thread then answers: it streams the file back for GET, closes and
+201s for uploads, or emits the recorded error status.
+
+There are no sockets and no state machine beyond the parser's own. The class
+owns one thread, one packet queue and one file handle — and **no mutex**: the
+server thread is the only thing touching request state, `enqueue_packet()`
+only touches the queue (a `k_fifo`, safe from threads and ISRs), and the
+single-consumer queue is what serialises requests.
 
 ### Threads
 
-- a feed thread owned by `UartBridge`, because the UART ISR may not block and
-  `input()` does file I/O
-- that's it — `RawHttpServer` itself creates none
+- the `RawHttpServer` thread: takes packets off the queue and runs the parser,
+  the file I/O and the output callback, one request at a time
+- a feed thread owned by `UartBridge`, because allocating a packet may block on
+  an exhausted pool, which the UART ISR may not do
 
 ## Building and running
 
@@ -143,19 +174,19 @@ and a 404 — so the mechanism is visible without a terminal attached:
 
 ```
 <inf> uart_bridge: UART uart_1 wired to the HTTP server
-<inf> http_server_bare: --> request 1: feeding 46 bytes in two chunks
+<inf> http_server_bare: --> request 1: feeding 46 bytes in two packets
 <inf> raw_http: GET /lfs/hello.txt
-<inf> http_server_bare: --> request 2: feeding 87 bytes in two chunks
+<inf> http_server_bare: --> request 2: feeding 87 bytes in two packets
 <inf> raw_http: PUT /lfs/upload.txt
-<inf> http_server_bare: --> request 3: feeding 47 bytes in two chunks
+<inf> http_server_bare: --> request 3: feeding 47 bytes in two packets
 <inf> raw_http: GET /lfs/upload.txt
-<inf> http_server_bare: --> request 4: feeding 48 bytes in two chunks
+<inf> http_server_bare: --> request 4: feeding 48 bytes in two packets
 <inf> raw_http: GET /files/missing.txt -> -2
 <inf> http_server_bare: Self-test done, now serving the UART forever
 ```
 
-Each request is handed over in **two separate calls** on purpose: the parser
-consumes a byte stream, so requests may be split across as many buffers as the
+Each request is handed over in **two separate packets** on purpose: the parser
+consumes a byte stream, so requests may be split across as many packets as the
 transport produces. Set `CONFIG_APP_SELFTEST=n` to skip the injected requests.
 
 The UART is selected by the `http-uart` devicetree alias; the supplied
@@ -234,10 +265,14 @@ its network driver.
 
 ## Things to watch out for
 
-- The output callback runs **inside `input()`**, on the caller's thread. Never
-  call `input()` from it.
+- The output callback runs on the **server's thread**, and the `net_buf` it
+  receives is the request's own packet about to be reused: copy or transmit
+  the bytes before returning. Blocking there is fine — it is the natural flow
+  control against a slow link.
 - Never assume a fixed callback size: one response may arrive over several
   calls, and `len` is whatever the server produced in one go.
+- Packet buffers must hold at least `RawHttpServer::response_head_max` (96)
+  bytes, since response heads are staged in them.
 - `Expect: 100-continue` is not implemented. Clients that send it (curl does
   for large uploads) will pause briefly before sending the body; pass
   `-H 'Expect:'` to avoid the delay.

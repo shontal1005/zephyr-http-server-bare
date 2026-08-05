@@ -7,6 +7,7 @@ menuconfig RAW_HTTP_SERVER
 	select FILE_SYSTEM
 	select NETWORKING
 	select HTTP_PARSER
+	select NET_BUF
 	help
 	  Serve file downloads and uploads over HTTP/1.1 on bare data buffers
 	  - a UART, a USB endpoint, shared memory - with no sockets, L2, IP
@@ -43,9 +44,24 @@ config RAW_HTTP_FILE_CHUNK
 	int "Bytes read from the filesystem per output callback"
 	default 1600
 	help
-	  A pure throughput-vs-RAM tradeoff costing exactly this many bytes
-	  per server instance. Uploads do not use this buffer - body
-	  fragments are written to the file straight from the input buffer.
+	  Download chunks are staged in the request's own packet buffer, so
+	  the effective chunk is the smaller of this and the net_buf pool's
+	  buffer size. Uploads do not use this - body fragments are written
+	  to the file straight from the request packet.
+
+config RAW_HTTP_THREAD_STACK_SIZE
+	int "Server thread stack size"
+	default 4096
+	help
+	  The server's own thread runs the parser, the filesystem I/O and the
+	  output callback on this stack.
+
+config RAW_HTTP_THREAD_PRIORITY
+	int "Server thread priority"
+	default 9
+	help
+	  Preemptible priority of the server thread. It spends its life
+	  blocked on the packet queue, so a low priority is fine.
 
 module = RAW_HTTP
 module-str = raw_http
