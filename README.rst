@@ -243,6 +243,28 @@ the default line discipline would mangle an HTTP byte stream:
 Set ``CONFIG_APP_SELFTEST=n`` to skip the injected requests and serve only what
 arrives on the UART.
 
+Testing against a real board
+****************************
+
+:file:`tests/http_over_serial_test.py` drives the whole thing over a serial
+device given as an argument:
+
+.. code-block:: console
+
+   ./tests/http_over_serial_test.py /dev/ttyUSB0
+   ./tests/http_over_serial_test.py /dev/ttyACM0 --baud 921600
+
+It downloads the seeded file, uploads a generated payload, reads it back and
+compares byte for byte, checks that a missing file returns 404, and re-downloads
+to prove the connection survived - every request on the same connection, so a
+clean run doubles as a keep-alive test. Exit status is 0 on pass, 1 on failure.
+
+``native_sim`` works through the same path: pass the pseudoterminal it prints for
+``uart1`` instead of a real device.
+
+pyserial is used when present and is required for ``--baud``; without it the
+device is opened raw, which is all a pseudoterminal needs.
+
 Things to watch out for
 ***********************
 

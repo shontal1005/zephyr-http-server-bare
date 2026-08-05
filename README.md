@@ -195,6 +195,35 @@ arrives on the UART.
 The UART is selected by the `http-uart` devicetree alias; the supplied
 `native_sim` overlay points it at `uart1` so the console keeps `uart0`.
 
+## Testing against a real board
+
+[`tests/http_over_serial_test.py`](tests/http_over_serial_test.py) drives the
+whole thing over a serial device given as an argument:
+
+```sh
+./tests/http_over_serial_test.py /dev/ttyUSB0
+./tests/http_over_serial_test.py /dev/ttyACM0 --baud 921600
+```
+
+It downloads the seeded file, uploads a generated payload, reads it back and
+compares byte for byte, checks that a missing file 404s, and finally re-downloads
+to prove the connection survived all of it — every request on the same
+connection, so a clean run is also a keep-alive test. Exit status is 0 on pass,
+1 on failure.
+
+`native_sim` works through the same path: it prints the pseudoterminal backing
+`uart1` at startup, so pass that instead of a real device.
+
+```sh
+./build/zephyr/zephyr.exe &          # prints: uart_1 connected to pseudotty: /dev/pts/9
+./tests/http_over_serial_test.py /dev/pts/9
+```
+
+pyserial is used when present and is required for `--baud`; without it the device
+is opened raw, which is all a pty needs. Useful flags: `--size` for the upload
+payload size, `--prefix` if you moved the URL prefix, and `--pace 0` to write
+each request in a single call (see the note on pacing below).
+
 ## Framing
 
 There is no framing below HTTP — and there never was. TCP does not provide
@@ -255,7 +284,8 @@ fields are bound by `CONFIG_HTTP_SERVER_MAX_HEADER_LEN`.
 - On `native_sim` this is easy to trip artificially: a pseudoterminal has no baud
   rate, and native_pty's interrupt-emulation thread runs at
   `K_HIGHEST_THREAD_PRIO` without sleeping, so it hands over a whole burst before
-  the feed thread is scheduled at all. Pace host writes for large uploads.
+  the feed thread is scheduled at all. Pace host writes for large uploads — the
+  test script does this by default, and `--pace 0` turns it off.
 - One `RawHttpServer` instance at a time: the listening socket is a
   process-wide singleton, so a second concurrent `start()` returns `-EEXIST`.
   This is a single-client design by construction.
