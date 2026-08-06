@@ -25,8 +25,8 @@ static void to_my_link(const uint8_t *data, size_t len, void *user)
         my_link_write(data, len);                // bytes out of the server
 }
 
-// second argument is the already-mounted directory files live in
-static RawHttpServer server(to_my_link, "/lfs");
+// the URL is the filesystem path: a mount at /lfs serves "GET /lfs/..."
+static RawHttpServer server(to_my_link);
 
 struct net_buf *packet = net_buf_alloc(&my_pool, K_FOREVER);
 net_buf_add_mem(packet, bytes_from_my_link, n);
@@ -75,9 +75,7 @@ the configuration notes). Everything tunable is a Kconfig option:
 
 | Option | Default | |
 |---|---|---|
-| `CONFIG_RAW_HTTP_FILES_PREFIX` | `/files/` | URL prefix files are served under |
-| `CONFIG_RAW_HTTP_URL_MAX` | 160 | longest accepted URL (414 beyond) |
-| `CONFIG_RAW_HTTP_PATH_MAX` | 256 | longest filesystem path built |
+| `CONFIG_RAW_HTTP_URL_MAX` | 160 | longest accepted URL (414 beyond); also bounds the filesystem path |
 | `CONFIG_RAW_HTTP_FILE_CHUNK` | 1600 | response staging buffer per instance; download bytes read per output callback |
 | `CONFIG_RAW_HTTP_THREAD_STACK_SIZE` | 4096 | the server thread's stack |
 | `CONFIG_RAW_HTTP_THREAD_PRIORITY` | 9 | the server thread's priority |
@@ -85,13 +83,17 @@ the configuration notes). Everything tunable is a Kconfig option:
 
 ## Files
 
-The constructor takes the path of a directory that is **already mounted** — the
-server never mounts anything itself. Files are served under `/files/`:
+The URL **is** the filesystem path, resolved through whatever filesystems are
+**already mounted** — the server never mounts anything itself, and Zephyr's
+VFS is the validator: a URL outside every mount, a `..` climbing above a
+filesystem root (littlefs refuses it) or a directory simply fails the
+filesystem call and is answered with 404. The sample mounts a littlefs at
+`/lfs`:
 
 ```
-GET  /files/report.bin      download <fs_root>/report.bin
-PUT  /files/report.bin      upload the request body to that path
-POST /files/report.bin      same as PUT
+GET  /lfs/report.bin      download the file at /lfs/report.bin
+PUT  /lfs/report.bin      upload the request body to that path
+POST /lfs/report.bin      same as PUT
 ```
 
 Downloads stream in chunks staged in the server's internal buffer —
@@ -184,7 +186,7 @@ and a 404 — so the mechanism is visible without a terminal attached:
 <inf> http_server_bare: --> request 3: feeding 47 bytes in two packets
 <inf> raw_http: GET /lfs/upload.txt
 <inf> http_server_bare: --> request 4: feeding 48 bytes in two packets
-<inf> raw_http: GET /files/missing.txt -> -2
+<inf> raw_http: GET /lfs/missing.txt -> -2
 <inf> http_server_bare: Self-test done, now serving the UART forever
 ```
 

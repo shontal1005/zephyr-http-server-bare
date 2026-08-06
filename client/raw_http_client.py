@@ -44,12 +44,13 @@ class RawHttpClient:
     many body bytes.
     """
 
-    def __init__(self, timeout=DEFAULT_TIMEOUT, prefix="/files/",
+    def __init__(self, timeout=DEFAULT_TIMEOUT, prefix="/lfs/",
                  pace=256, gap=0.005):
         """
         :param timeout: seconds to wait for one complete response
-        :param prefix: URL prefix files are served under
-                       (CONFIG_RAW_HTTP_FILES_PREFIX)
+        :param prefix: URL prefix files are served under - the server maps
+                       URLs straight to filesystem paths, so this is the
+                       board's mount point (the sample mounts at /lfs)
         :param pace: bytes per send() call, 0 to write everything in one go
         :param gap: seconds between paced sends
         """
@@ -258,8 +259,9 @@ def main():
                         help="baud rate (needs pyserial; ignored for a pty)")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help="seconds to wait for one response")
-    parser.add_argument("--prefix", default="/files/",
-                        help="URL prefix files are served under")
+    parser.add_argument("--prefix", default="/lfs/",
+                        help="URL prefix files are served under "
+                             "(the board's mount point)")
     parser.add_argument("--pace", type=int, default=256,
                         help="bytes per write, 0 to disable pacing")
     parser.add_argument("--gap", type=float, default=0.005,

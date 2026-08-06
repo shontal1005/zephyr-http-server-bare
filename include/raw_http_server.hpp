@@ -14,14 +14,16 @@
  *   - enqueue_packet(net_buf) - packets of raw request bytes go in
  *   - the OutputCallback given to the constructor - response bytes come out
  *
- * GET downloads a file from an already-mounted directory, PUT and POST upload
- * one into it. The server owns a thread that drains the packet queue; requests
- * are handled strictly one at a time, in arrival order - a packet enqueued
- * while a response is still streaming simply waits in the queue.
+ * The request URL is the filesystem path: "GET /lfs/report.bin" serves the
+ * file at /lfs/report.bin through whatever is mounted there, and PUT/POST
+ * upload to that path. The VFS is the validator - a URL outside every mount
+ * simply fails the filesystem call and is answered with 404. The server owns
+ * a thread that drains the packet queue; requests are handled strictly one at
+ * a time, in arrival order - a packet enqueued while a response is still
+ * streaming simply waits in the queue.
  *
- * The URL prefix, the URL/path bounds and the download chunk size are Kconfig
- * options: CONFIG_RAW_HTTP_FILES_PREFIX, CONFIG_RAW_HTTP_URL_MAX,
- * CONFIG_RAW_HTTP_PATH_MAX and CONFIG_RAW_HTTP_FILE_CHUNK. The thread is
+ * The URL bound and the download chunk size are Kconfig options:
+ * CONFIG_RAW_HTTP_URL_MAX and CONFIG_RAW_HTTP_FILE_CHUNK. The thread is
  * shaped by CONFIG_RAW_HTTP_THREAD_STACK_SIZE and
  * CONFIG_RAW_HTTP_THREAD_PRIORITY.
  *
@@ -33,7 +35,7 @@
  *         my_link_write(data, len);
  * }
  *
- * static RawHttpServer server(to_my_link, "/lfs");
+ * static RawHttpServer server(to_my_link);
  *
  * struct net_buf *packet = net_buf_alloc(&my_pool, K_FOREVER);
  * net_buf_add_mem(packet, bytes_from_my_link, n);
@@ -95,16 +97,15 @@ class RawHttpServer {
   /**
    * @brief Construct the server and start its thread.
    *
+   * Files are served from whatever filesystems are mounted - the URL is
+   * the filesystem path, so a mount at "/lfs" serves "GET /lfs/...".
+   * Nothing is created or mounted here.
+   *
    * @param output_callback Callback receiving response bytes. Must not be
    * nullptr.
-   * @param fs_root Already-mounted directory that files are served from
-   *                and uploaded into, e.g. "/lfs". Not created or mounted
-   *                here.
    * @param user_data Opaque pointer forwarded to @p output_callback.
    */
-  RawHttpServer(OutputCallback output_callback,
-                const char* fs_root,
-                void* user_data = nullptr);
+  RawHttpServer(OutputCallback output_callback, void* user_data = nullptr);
 
   /**
    * @brief Stop the server thread and release everything it held.
@@ -135,9 +136,6 @@ class RawHttpServer {
    */
   int enqueue_packet(struct net_buf* packet);
 
-  /** @brief The filesystem root passed to the constructor. */
-  const char* fs_root() const { return _fs_root; }
-
  private:
   /**
    * @brief Parser callback: a new request has started.
@@ -160,10 +158,12 @@ class RawHttpServer {
    * @brief Parser callback: the request head is complete.
    *
    * An upgrade (CONNECT, Upgrade:) is refused with a 400 - no other
-   * protocol is spoken here. For PUT and POST this opens the
+   * protocol is spoken here. The query string is cut off the URL: what
+   * remains is the filesystem path. For PUT and POST this opens the
    * destination file, so that body fragments can be written straight
-   * through as they arrive. Any other method than GET/PUT/POST fails
-   * the request with a 405.
+   * through as they arrive - a path the VFS refuses (no mount there,
+   * ".." above a root, a directory) is a 404. Any other method than
+   * GET/PUT/POST fails the request with a 405.
    */
   static int on_headers_complete(struct http_parser* parser);
 
@@ -193,22 +193,14 @@ class RawHttpServer {
   /**
    * @brief The server thread: take packets off the queue, forever.
    *
-   * One packet at a time: parse it, answer any request it completed,
-   * release it. Everything - parser callbacks, file I/O, the output
-   * callback - runs here, so nothing else can interleave with a
-   * request.
+   * One packet at a time: parse it, answer any request it completed
+   * inline via on_message_complete(), release it. An upgrade's
+   * foreign-protocol remainder is dropped, garbage goes to
+   * fail_stream(), a zero-length packet to handle_stream_break().
+   * Everything - parser callbacks, file I/O, the output callback -
+   * runs here, so nothing else can interleave with a request.
    */
   void run_loop();
-
-  /**
-   * @brief Parse one packet; completed requests are answered inline.
-   *
-   * on_message_complete() answers each request the packet completes.
-   * An upgrade's foreign-protocol remainder is dropped, garbage goes
-   * to fail_stream(), a zero-length packet to handle_stream_break(),
-   * and a clean fragment produces no output at all.
-   */
-  void process_packet(struct net_buf* packet);
 
   /**
    * @brief Answer 400 once per failure burst, then reset the parser.
@@ -236,23 +228,12 @@ class RawHttpServer {
   void answer();
 
   /**
-   * @brief Map the request URL to an absolute path under the fs root.
-   *
-   * Strips the query string, requires CONFIG_RAW_HTTP_FILES_PREFIX, and
-   * rejects ".." so nothing outside the root is reachable.
-   *
-   * @return 0 on success, -ENOENT for a URL outside the prefix or an
-   *         empty/traversing name, -ENAMETOOLONG if it does not fit.
-   */
-  int build_path(char* out, size_t out_size) const;
-
-  /**
    * @brief Serve a GET: open the file, send the head, stream the body.
    *
-   * The size comes from fs_stat(), so the response carries a plain
-   * Content-Length - no chunked encoding. A file that cannot be opened
-   * or stat'd is a 404. Body chunks are read into _out_buf, one output
-   * callback per chunk.
+   * The URL is the path. The size comes from fs_stat(), so the response
+   * carries a plain Content-Length - no chunked encoding. Anything that
+   * cannot be stat'd or opened, or is not a regular file, is a 404.
+   * Body chunks are read into _out_buf, one output callback per chunk.
    */
   void send_file();
 
@@ -282,7 +263,6 @@ class RawHttpServer {
 
   OutputCallback _output_callback;
   void* _user_data;
-  const char* _fs_root;
 
   struct http_parser _parser{};
 
@@ -305,8 +285,9 @@ class RawHttpServer {
   /** A request is mid-parse: on_message_begin() sets, reset_request()
    * clears. */
   bool _request_active{false};
-  /** Path of an upload not yet committed; empty when none. */
-  char _upload_path[CONFIG_RAW_HTTP_PATH_MAX]{};
+  /** An upload at _url is open but not yet committed. abort_upload()
+   * unlinks _url, so reset_request() clears _url only after it ran. */
+  bool _upload_pending{false};
   /** Nonzero once the request has failed; the status to answer with. */
   unsigned int _error_status{0};
 };

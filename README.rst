@@ -26,8 +26,8 @@ The application-facing surface is a single C++ class, ``RawHttpServer``:
            my_link_write(data, len);                /* bytes out of the server */
    }
 
-   /* second argument is the already-mounted directory files live in */
-   static RawHttpServer server(to_my_link, "/lfs");
+   /* the URL is the filesystem path: a mount at /lfs serves "GET /lfs/..." */
+   static RawHttpServer server(to_my_link);
 
    struct net_buf *packet = net_buf_alloc(&my_pool, K_FOREVER);
    net_buf_add_mem(packet, bytes_from_my_link, n);
@@ -61,21 +61,25 @@ sample code showing one way to feed it. Add the repository to
    CONFIG_RAW_HTTP_SERVER=y
 
 ``RAW_HTTP_SERVER`` selects ``CPP``, ``FILE_SYSTEM``, ``HTTP_PARSER``,
-``NET_BUF`` and ``NETWORKING``. The URL prefix, URL/path bounds, download chunk
-size, thread stack size and priority, and log level are Kconfig options under
-the ``RAW_HTTP_SERVER`` menu.
+``NET_BUF`` and ``NETWORKING``. The URL bound, download chunk size, thread
+stack size and priority, and log level are Kconfig options under the
+``RAW_HTTP_SERVER`` menu.
 
 Files
 *****
 
-The constructor takes the path of a directory that is **already mounted** - the
-server never mounts anything itself. Files are served under ``/files/``:
+The URL **is** the filesystem path, resolved through whatever filesystems are
+**already mounted** - the server never mounts anything itself, and Zephyr's
+VFS is the validator: a URL outside every mount, a ``..`` climbing above a
+filesystem root (littlefs refuses it) or a directory simply fails the
+filesystem call and is answered with 404. The sample mounts a littlefs at
+``/lfs``:
 
 .. code-block:: console
 
-   GET  /files/report.bin      download a file from <fs_root>/report.bin
-   PUT  /files/report.bin      upload the request body to that path
-   POST /files/report.bin      same as PUT
+   GET  /lfs/report.bin      download the file at /lfs/report.bin
+   PUT  /lfs/report.bin      upload the request body to that path
+   POST /lfs/report.bin      same as PUT
 
 Downloads stream in chunks staged in the server's internal buffer -
 ``CONFIG_RAW_HTTP_FILE_CHUNK`` bytes per output callback - so file size is not
@@ -193,7 +197,7 @@ and a 404 - so the mechanism is visible without a terminal attached:
    <inf> http_server_bare: --> request 3: feeding 47 bytes in two packets
    <inf> raw_http: GET /lfs/upload.txt
    <inf> http_server_bare: --> request 4: feeding 48 bytes in two packets
-   <inf> raw_http: GET /files/missing.txt -> -2
+   <inf> raw_http: GET /lfs/missing.txt -> -2
    <inf> http_server_bare: Self-test done, now serving the UART forever
 
 Each request is handed over in two separate packets on purpose: the parser

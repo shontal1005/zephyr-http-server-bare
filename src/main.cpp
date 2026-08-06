@@ -31,9 +31,9 @@
 LOG_MODULE_REGISTER(http_server_bare, LOG_LEVEL_INF);
 
 /*
- * Files are served from an already-mounted directory. A real board typically
- * mounts its storage during boot and simply hands the path to the server; this
- * sample mounts a littlefs on native_sim so it has something to serve.
+ * The URL is the filesystem path, so whatever is mounted is servable at its
+ * mount point: this littlefs at /lfs makes "GET /lfs/hello.txt" work. A real
+ * board typically mounts its storage during boot and mounts nothing here.
  */
 #define FILES_MOUNT_POINT "/lfs"
 
@@ -83,9 +83,7 @@ NET_BUF_POOL_DEFINE(http_packet_pool,
 /* The UART carrying HTTP. Constructing the bridge starts the server's thread,
  * which is safe at namespace scope; the UART side happens in start().
  */
-static UartBridge bridge(DEVICE_DT_GET(DT_ALIAS(http_uart)),
-                         FILES_MOUNT_POINT,
-                         &http_packet_pool);
+static UartBridge bridge(DEVICE_DT_GET(DT_ALIAS(http_uart)), &http_packet_pool);
 
 #if defined(CONFIG_APP_SELFTEST)
 /*
@@ -94,18 +92,15 @@ static UartBridge bridge(DEVICE_DT_GET(DT_ALIAS(http_uart)),
  */
 static const char* const selftest_requests[] = {
     /* download the seeded file */
-    "GET " CONFIG_RAW_HTTP_FILES_PREFIX
-    "hello.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+    "GET " FILES_MOUNT_POINT "/hello.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
     /* upload a new one ... */
-    "PUT " CONFIG_RAW_HTTP_FILES_PREFIX
-    "upload.txt HTTP/1.1\r\nHost: bare\r\n"
+    "PUT " FILES_MOUNT_POINT
+    "/upload.txt HTTP/1.1\r\nHost: bare\r\n"
     "Content-Length: 21\r\n\r\nuploaded over a UART\n",
     /* ... and read it back */
-    "GET " CONFIG_RAW_HTTP_FILES_PREFIX
-    "upload.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+    "GET " FILES_MOUNT_POINT "/upload.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
     /* a missing file 404s and the stream keeps serving */
-    "GET " CONFIG_RAW_HTTP_FILES_PREFIX
-    "missing.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+    "GET " FILES_MOUNT_POINT "/missing.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
 };
 
 /* Wrap a slice of a request in a packet and queue it for the server. */

@@ -18,11 +18,11 @@ startup ("uart_1 connected to pseudotty: /dev/pts/9"), so just pass that path::
 
 Checks, in order:
 
-  1. GET  /files/hello.txt   downloads the seeded file
-  2. PUT  /files/<name>      uploads a generated payload
-  3. GET  /files/<name>      reads it back and compares byte for byte
-  4. GET  /files/<missing>   returns 404 without dropping the connection
-  5. GET  /files/hello.txt   still works, proving keep-alive across all of it
+  1. GET  /lfs/hello.txt   downloads the seeded file
+  2. PUT  /lfs/<name>      uploads a generated payload
+  3. GET  /lfs/<name>      reads it back and compares byte for byte
+  4. GET  /lfs/<missing>   returns 404 without dropping the connection
+  5. GET  /lfs/hello.txt   still works, proving keep-alive across all of it
 
 Every request rides the same connection, so a clean run also proves the server
 never hung up. pyserial is used when available (needed to set a baud rate);
@@ -189,7 +189,7 @@ def main():
     parser.add_argument("--name", default="up.bin", help="filename to upload")
     parser.add_argument("--seeded", default="hello.txt",
                         help="a file expected to already exist under the fs root")
-    parser.add_argument("--prefix", default="/files/", help="URL prefix files are served under")
+    parser.add_argument("--prefix", default="/lfs/", help="URL prefix files are served under")
     parser.add_argument("--pace", type=int, default=256,
                         help="bytes per write, 0 to disable pacing")
     parser.add_argument("--gap", type=float, default=0.005, help="seconds between paced writes")

@@ -20,25 +20,14 @@ menuconfig RAW_HTTP_SERVER
 
 if RAW_HTTP_SERVER
 
-config RAW_HTTP_FILES_PREFIX
-	string "URL prefix files are served under"
-	default "/files/"
-	help
-	  Requests outside this prefix are answered with 404.
-
 config RAW_HTTP_URL_MAX
 	int "Longest accepted URL, query string included"
 	default 160
 	help
 	  Longer requests are answered with 414 URI Too Long rather than
-	  silently truncated. Costs this many bytes per server instance.
-
-config RAW_HTTP_PATH_MAX
-	int "Longest filesystem path built from a URL"
-	default 256
-	help
-	  Buffer for "<fs_root>/<name>". 256 covers the usual 255-character
-	  filesystem name limit; a longer result is answered with 404.
+	  silently truncated. The URL (query string cut off) is also the
+	  filesystem path, so this bounds that too. Costs this many bytes
+	  per server instance.
 
 config RAW_HTTP_FILE_CHUNK
 	int "Bytes read from the filesystem per output callback"

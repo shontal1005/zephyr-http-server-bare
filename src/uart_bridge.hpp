@@ -32,15 +32,12 @@ class UartBridge {
  public:
   /**
    * @param uart The UART carrying the HTTP byte stream.
-   * @param fs_root Already-mounted directory files are served from.
    * @param pool Pool the request packets are allocated from; the
    *             buffer size only sets how RX bytes are chunked. The
    *             server frees each packet when done with it.
    */
-  UartBridge(const struct device* uart,
-             const char* fs_root,
-             struct net_buf_pool* pool)
-      : _uart(uart), _pool(pool), _server(on_server_output, fs_root, this) {}
+  UartBridge(const struct device* uart, struct net_buf_pool* pool)
+      : _uart(uart), _pool(pool), _server(on_server_output, this) {}
 
   UartBridge(const UartBridge&) = delete;
   UartBridge& operator=(const UartBridge&) = delete;
