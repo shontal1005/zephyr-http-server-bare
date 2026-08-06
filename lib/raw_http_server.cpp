@@ -63,7 +63,7 @@ RawHttpServer::RawHttpServer(OutputCallback output_callback, void* user_data)
     : _output_callback(output_callback), _user_data(user_data) {
   k_fifo_init(&_rx_fifo);
 
-  // process_buffer() reinitialises the parser per parse attempt and
+  // process_request() reinitialises the parser per parse attempt and
   // http_parser_init() preserves this pointer, so set it once here.
   _parser.data = this;
 
@@ -115,136 +115,126 @@ void RawHttpServer::run_loop() {
 }
 
 void RawHttpServer::handle_packet(const struct net_buf* packet) {
-  size_t off = 0;
+  // Bytes owed to an answered request's body are not ours to parse:
+  // count them down and drop them without ever buffering them.
+  size_t off = (size_t)MIN((uint64_t)packet->len, _skip);
 
-  while (off < packet->len) {
-    // Bytes owed to an answered request's body are not ours to parse:
-    // count them down and drop them without ever buffering them.
-    if (_skip > 0) {
-      size_t take = (size_t)MIN((uint64_t)(packet->len - off), _skip);
+  _skip -= off;
 
-      _skip -= take;
-      off += take;
-      continue;
-    }
-
-    size_t space = sizeof(_request_buf) - _request_len;
-    size_t take = MIN(space, packet->len - off);
-
-    memcpy(_request_buf + _request_len, packet->data + off, take);
-    _request_len += take;
-    off += take;
-
-    process_buffer();
-
-    // Nothing consumable and no room left: the head outgrew the
-    // buffer. Answer and reset - the stream self-heals at the next
-    // parseable request.
-    if (_request_len == sizeof(_request_buf)) {
-      LOG_WRN("Request head longer than %zu, refused", sizeof(_request_buf));
-      respond(HTTP_431_REQUEST_HEADER_FIELDS_TOO_LARGE, 0);
-      _request_len = 0;
-    }
+  if (off == packet->len) {
+    return;
   }
+
+  size_t space = sizeof(_request_buf) - _request_len;
+  size_t take = MIN(space, packet->len - off);
+
+  memcpy(_request_buf + _request_len, packet->data + off, take);
+  _request_len += take;
+
+  bool answered = process_request();
+
+  // No head and no room left: the head outgrew the buffer. Answer and
+  // reset - the stream self-heals at the next parseable request.
+  if (!answered && _request_len == sizeof(_request_buf)) {
+    LOG_WRN("Request head longer than %zu, refused", sizeof(_request_buf));
+    respond(HTTP_431_REQUEST_HEADER_FIELDS_TOO_LARGE, 0);
+    _request_len = 0;
+  }
+
+  // One request per round trip: the rest of the packet is dropped. It
+  // must still be discounted against _skip - if the head completed
+  // exactly as the buffer filled, this remainder is the answered
+  // request's own body, not future request bytes.
+  size_t remainder = packet->len - off - take;
+
+  _skip -= MIN(_skip, (uint64_t)remainder);
 }
 
-void RawHttpServer::process_buffer() {
-  // Serve every request whose head is complete, in arrival order.
-  while (_request_len > 0) {
-    // A fresh parse from the buffer start each time: no parser state
-    // survives between attempts, so packet boundaries cannot matter.
-    http_parser_init(&_parser, HTTP_REQUEST);
-    _url_len = 0;
-    _url[0] = '\0';
+bool RawHttpServer::process_request() {
+  // A fresh parse from the buffer start each time: no parser state
+  // survives between attempts, so packet boundaries cannot matter.
+  http_parser_init(&_parser, HTTP_REQUEST);
+  _url_len = 0;
+  _url[0] = '\0';
 
-    size_t parsed = http_parser_execute(
-        &_parser, &_settings, reinterpret_cast<const char*>(_request_buf),
-        _request_len);
+  size_t parsed = http_parser_execute(
+      &_parser, &_settings, reinterpret_cast<const char*>(_request_buf),
+      _request_len);
 
-    // on_headers_complete() halts the parser on purpose, so the errno
-    // is the whole verdict - and HPE_OK honestly means "incomplete".
-    enum http_errno err = HTTP_PARSER_ERRNO(&_parser);
+  // on_headers_complete() halts the parser on purpose, so the errno
+  // is the whole verdict - and HPE_OK honestly means "incomplete".
+  enum http_errno err = HTTP_PARSER_ERRNO(&_parser);
 
-    if (err == HPE_OK) {
-      // The head is not all here yet: wait for more bytes.
-      return;
-    }
-
-    if (err == HPE_CB_url) {
-      // on_url() fails for exactly one reason: the URL outgrew _url.
-      LOG_WRN("URL longer than %zu, refused", sizeof(_url) - 1);
-      respond(HTTP_414_URI_TOO_LONG, 0);
-      _request_len = 0;
-      return;
-    }
-
-    if (err != HPE_CB_headers_complete) {
-      // Malformed bytes; boundaries are unknown, so drop the lot.
-      LOG_WRN("Unparseable bytes dropped (%s)", http_errno_name(err));
-      respond(HTTP_400_BAD_REQUEST, 0);
-      _request_len = 0;
-      return;
-    }
-
-    // One complete head. The parse stopped at the final LF, which is
-    // not yet counted - hence the +1.
-    size_t head_len = parsed + 1;
-
-    if (_parser.upgrade) {
-      // No other protocol is spoken here (CONNECT included), and what
-      // follows an upgrade head is not HTTP: drop the lot.
-      LOG_WRN("Upgrade request refused");
-      respond(HTTP_400_BAD_REQUEST, 0);
-      _request_len = 0;
-      return;
-    }
-
-    if ((_parser.flags & F_CHUNKED) != 0) {
-      // A chunked body has no predeclared length to skip past.
-      LOG_WRN("Chunked request refused");
-      respond(HTTP_400_BAD_REQUEST, 0);
-      _request_len = 0;
-      return;
-    }
-
-    if (_parser.method != HTTP_GET) {
-      LOG_WRN("%s refused: GET is the whole surface",
-              http_method_str((enum http_method)_parser.method));
-      respond(HTTP_405_METHOD_NOT_ALLOWED, 0);
-    } else {
-      // Cut the query string off: what remains is the filesystem
-      // path, handed to the VFS as-is - the mount table does the
-      // validation that a path builder otherwise would.
-      char* query = strchr(_url, '?');
-      if (query != nullptr) {
-        *query = '\0';
-      }
-
-      send_file();
-    }
-
-    // Consume the head, then the body: the parser never sees body
-    // bytes. What is already buffered goes now; the rest is counted
-    // down by handle_packet() as it arrives. No Content-Length header
-    // parses as the all-ones sentinel (the parser's ULLONG_MAX) =
-    // no body.
-    uint64_t body =
-        _parser.content_length == UINT64_MAX ? 0 : _parser.content_length;
-    size_t buffered_body =
-        (size_t)MIN(body, (uint64_t)(_request_len - head_len));
-    size_t drop = head_len + buffered_body;
-
-    _skip = body - buffered_body;
-
-    memmove(_request_buf, _request_buf + drop, _request_len - drop);
-    _request_len -= drop;
-
-    if (_skip > 0) {
-      // The rest of the body is still in flight; handle_packet()
-      // discards it before any further byte is buffered.
-      return;
-    }
+  if (err == HPE_OK) {
+    // The head is not all here yet: wait for more bytes.
+    return false;
   }
+
+  if (err == HPE_CB_url) {
+    // on_url() fails for exactly one reason: the URL outgrew _url.
+    LOG_WRN("URL longer than %zu, refused", sizeof(_url) - 1);
+    respond(HTTP_414_URI_TOO_LONG, 0);
+    _request_len = 0;
+    return true;
+  }
+
+  if (err != HPE_CB_headers_complete) {
+    // Malformed bytes; boundaries are unknown, so drop the lot.
+    LOG_WRN("Unparseable bytes dropped (%s)", http_errno_name(err));
+    respond(HTTP_400_BAD_REQUEST, 0);
+    _request_len = 0;
+    return true;
+  }
+
+  // One complete head. The parse stopped at the final LF, which is
+  // not yet counted - hence the +1.
+  size_t head_len = parsed + 1;
+
+  if (_parser.upgrade) {
+    // No other protocol is spoken here (CONNECT included), and what
+    // follows an upgrade head is not HTTP: drop the lot.
+    LOG_WRN("Upgrade request refused");
+    respond(HTTP_400_BAD_REQUEST, 0);
+    _request_len = 0;
+    return true;
+  }
+
+  if ((_parser.flags & F_CHUNKED) != 0) {
+    // A chunked body has no predeclared length to skip past.
+    LOG_WRN("Chunked request refused");
+    respond(HTTP_400_BAD_REQUEST, 0);
+    _request_len = 0;
+    return true;
+  }
+
+  if (_parser.method != HTTP_GET) {
+    LOG_WRN("%s refused: GET is the whole surface",
+            http_method_str((enum http_method)_parser.method));
+    respond(HTTP_405_METHOD_NOT_ALLOWED, 0);
+  } else {
+    // Cut the query string off: what remains is the filesystem
+    // path, handed to the VFS as-is - the mount table does the
+    // validation that a path builder otherwise would.
+    char* query = strchr(_url, '?');
+    if (query != nullptr) {
+      *query = '\0';
+    }
+
+    send_file();
+  }
+
+  // Answered: drop everything buffered beyond the head - body bytes
+  // and early next-request bytes alike. Only the body remainder still
+  // in flight is owed to _skip. No Content-Length header parses as
+  // the all-ones sentinel (the parser's ULLONG_MAX) = no body.
+  uint64_t body =
+      _parser.content_length == UINT64_MAX ? 0 : _parser.content_length;
+  size_t extra = _request_len - head_len;
+
+  _skip = body > extra ? body - extra : 0;
+  _request_len = 0;
+
+  return true;
 }
 
 int RawHttpServer::on_url(struct http_parser* parser,
@@ -254,7 +244,7 @@ int RawHttpServer::on_url(struct http_parser* parser,
 
   // Refuse an oversized URL rather than truncating, which would
   // silently address the wrong file. Failing the parse here surfaces
-  // as HPE_CB_url, which process_buffer() answers with 414.
+  // as HPE_CB_url, which process_request() answers with 414.
   if (self->_url_len + length >= sizeof(self->_url)) {
     return -1;
   }
@@ -272,7 +262,7 @@ int RawHttpServer::on_headers_complete(struct http_parser* parser) {
   // Halt the parser exactly here: the head is everything a GET-only
   // server needs, and the body - if any - is skipped by length, never
   // parsed. The resulting HPE_CB_headers_complete errno is
-  // process_buffer()'s success verdict. (0, 1 and 2 are magic values
+  // process_request()'s success verdict. (0, 1 and 2 are magic values
   // to this callback; -1 is not.)
   return -1;
 }

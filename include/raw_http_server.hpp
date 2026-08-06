@@ -22,10 +22,11 @@
  *
  * Packets carry arbitrary chunks of the byte stream - the server does the
  * framing. Request heads are assembled in an internal buffer, so a request
- * may be split across any number of packets, and one packet may carry
- * several pipelined requests - each is answered in order as its head
- * completes. A refused request's body is never buffered: it is counted
- * down and discarded as it streams past.
+ * may be split across any number of packets. The server answers one request
+ * per client round trip: once a request is answered, everything already
+ * received beyond it is dropped, so a client must read the response before
+ * sending its next request. A refused request's body is never buffered:
+ * it is counted down and discarded as it streams past.
  *
  * The head-assembly bound and the download chunk size are Kconfig options:
  * CONFIG_RAW_HTTP_HEAD_MAX and CONFIG_RAW_HTTP_FILE_CHUNK, plus
@@ -66,8 +67,11 @@
  * 404 (nothing servable at that path), 405 (not a GET), 414 (URL too long),
  * 431 (head outgrew the assembly buffer), 400 (malformed, chunked, or an
  * upgrade). An incomplete request is simply waited on - the head completes
- * whenever its bytes arrive. Unparseable bytes cost a single 400 and a
- * stream reset; the stream self-heals at the next request boundary.
+ * whenever its bytes arrive. A request sent ahead of the previous response
+ * is dropped, never answered - its tail may later parse as garbage and
+ * earn a stray 400, from which the stream self-heals. Unparseable bytes
+ * cost a single 400 and a stream reset; the stream self-heals at the next
+ * request boundary.
  *
  * All parsing, file I/O and response generation happen on the server's own
  * thread, which is the only thread touching any request state - so the class
@@ -124,9 +128,10 @@ class RawHttpServer {
    * @brief Hand a chunk of the request byte stream to the server.
    *
    * Packets are arbitrary chunks: a request may span any number of
-   * packets and one packet may carry several pipelined requests - the
-   * server reassembles and answers each in order. A zero-length packet
-   * carries no bytes and is dropped silently.
+   * packets - the server reassembles it. One request is answered per
+   * round trip: bytes received beyond the answered request are dropped,
+   * so do not send a request before reading the previous response. A
+   * zero-length packet carries no bytes and is dropped silently.
    *
    * Ownership of @p packet passes to the server (and stays with the
    * caller on error). Flat buffers only - fragment chains are rejected.
@@ -141,7 +146,7 @@ class RawHttpServer {
   /**
    * @brief Parser callback: accumulate the (possibly split) URL.
    *
-   * Fails the parse on overflow - process_buffer() reads that back as
+   * Fails the parse on overflow - process_request() reads that back as
    * HPE_CB_url and answers 414 rather than truncating silently.
    */
   static int on_url(struct http_parser* parser, const char* at, size_t length);
@@ -151,8 +156,8 @@ class RawHttpServer {
    *
    * Always returns nonzero, on purpose: the head is everything a
    * GET-only server needs, so the body is never parsed - it is skipped
-   * by Content-Length in process_buffer(). The resulting
-   * HPE_CB_headers_complete errno is process_buffer()'s success
+   * by Content-Length in process_request(). The resulting
+   * HPE_CB_headers_complete errno is process_request()'s success
    * verdict.
    */
   static int on_headers_complete(struct http_parser* parser);
@@ -174,30 +179,35 @@ class RawHttpServer {
   /**
    * @brief Feed one packet of stream bytes through the server.
    *
-   * Interleaves three consumers over the packet: bytes owed to a
-   * refused body are discarded (_skip), the rest is appended to
-   * _request_buf and process_buffer() serves every head that
-   * completes. A head that outgrows a full buffer is answered with
-   * 431 and the buffer reset - the stream self-heals at the next
-   * parseable request.
+   * Body bytes owed to the previously answered request are discarded
+   * first (_skip), what fits of the rest is appended to _request_buf
+   * and process_request() makes one parse attempt. A head that
+   * outgrows a full buffer is answered with 431 and the buffer reset.
+   * Once a request is answered the packet's remainder is dropped -
+   * discounted against _skip first, since it may be that request's
+   * own body - so at most one response leaves per packet.
    */
   void handle_packet(const struct net_buf* packet);
 
   /**
-   * @brief Parse and answer every complete request head in _request_buf.
+   * @brief One parse attempt over _request_buf; answer if it completes.
    *
-   * Each attempt reinitialises the parser and re-parses the buffer
-   * from the start, so no parser state survives between packets.
+   * Reinitialises the parser and parses the buffer from the start, so
+   * no parser state survives between packets.
    * on_headers_complete() halts the parser at the end of the head,
    * which makes the parser's errno the whole verdict:
    * HPE_CB_headers_complete is success, HPE_OK means the head is
    * still incomplete (wait for more bytes), HPE_CB_url is an overlong
    * URL (414), anything else is malformed bytes (400). On success the
    * request is answered (upgrade/CONNECT 400, chunked 400, non-GET
-   * 405, GET served), the head is consumed from the buffer and the
-   * body - if any - is scheduled for discard via _skip.
+   * 405, GET served), the buffer is reset - dropping any bytes beyond
+   * the head - and the body remainder still in flight is scheduled
+   * for discard via _skip.
+   *
+   * @return true if a response was sent, false if the head is still
+   *         incomplete.
    */
-  void process_buffer();
+  bool process_request();
 
   /**
    * @brief Serve the GET: open the file, send the head, stream the body.
@@ -235,7 +245,7 @@ class RawHttpServer {
   /** Body bytes still owed to an answered request, discarded on arrival. */
   uint64_t _skip{0};
 
-  /* Per-parse state, reset by process_buffer() before each attempt. */
+  /* Per-parse state, reset by process_request() before each attempt. */
   char _url[CONFIG_RAW_HTTP_URL_MAX]{};
   size_t _url_len{0};
 };

@@ -9,10 +9,11 @@ Runs against native_sim by default; pass ``--device /dev/ttyUSB0`` (and
 
 The server is GET-only and reassembles the request byte stream itself, so
 these tests deliberately abuse the transport framing: requests split at
-arbitrary points, dribbled a byte at a time, pipelined several to a write.
-The refusal tests (405, 414, 431, 400) send raw requests via
-``client.request()`` and look at the status; most of them finish with a
-successful download to prove the stream healed.
+arbitrary points, dribbled a byte at a time, sent ahead of the previous
+response (which drops them - one request per round trip). The refusal
+tests (405, 414, 431, 400) send raw requests via ``client.request()`` and
+look at the status; most of them finish with a successful download to
+prove the stream healed.
 """
 
 import time
@@ -101,7 +102,7 @@ def test_path_outside_any_mount_is_404(client):
 
 
 # --------------------------------------------------------------------------
-# Split, dribbled and pipelined requests: the server does the framing
+# Split and dribbled requests: the server does the framing
 # --------------------------------------------------------------------------
 
 
@@ -149,35 +150,39 @@ def test_split_at_every_interesting_boundary(client):
         assert body == SEEDED_BODY
 
 
-def test_pipelined_requests_in_one_write(client):
-    """Two requests in one write get two responses, in order."""
+def test_request_sent_ahead_is_dropped(client, tmp_path):
+    """One request per round trip: a second request sent before reading
+    the first response is dropped, never answered."""
     missing = b"GET /lfs/nope.bin HTTP/1.1\r\nHost: raw\r\n\r\n"
 
     client.send(GET_SEEDED + missing)
 
-    status1, body1 = client._read_response()
-    status2, _ = client._read_response()
+    status, body = client._read_response()
 
-    assert (status1, status2) == (200, 404)
-    assert body1 == SEEDED_BODY
+    assert status == 200
+    assert body == SEEDED_BODY
+    assert_quiet(client)  # the second request earned nothing
+    assert_downloads_seeded(client, tmp_path)
 
 
-def test_pipelined_batch_split_mid_request(client):
+def test_request_tail_sent_ahead_self_heals(client, tmp_path):
     """A full request plus the start of the next in one write: the first
-    is answered at once, the second when its remainder arrives."""
+    is answered, the half-request is dropped with it. Its remainder,
+    arriving alone, parses as garbage and earns a 400 - the documented
+    self-heal path - after which the stream is healthy again."""
     half = len(GET_SEEDED) // 2
 
     client.send(GET_SEEDED + GET_SEEDED[:half])
 
-    status1, body1 = client._read_response()
-    assert status1 == 200
-    assert body1 == SEEDED_BODY
+    status, body = client._read_response()
+    assert status == 200
+    assert body == SEEDED_BODY
 
-    client.send(GET_SEEDED[half:])
+    # The orphaned second half is not valid HTTP on its own.
+    status, _ = client.request(GET_SEEDED[half:])
+    assert status == 400
 
-    status2, body2 = client._read_response()
-    assert status2 == 200
-    assert body2 == SEEDED_BODY
+    assert_downloads_seeded(client, tmp_path)
 
 
 # --------------------------------------------------------------------------

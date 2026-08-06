@@ -41,11 +41,13 @@ thread or ISR - and the server's thread consumes packets in arrival order,
 answering each request through the output callback as its head completes:
 requests are never handled in parallel. A request may be split across any
 number of packets - its head is assembled in an internal buffer of
-``CONFIG_RAW_HTTP_HEAD_MAX`` bytes - and one packet may carry several
-pipelined requests, each answered in order as its head completes. Bodies are
-**never** buffered: a refused PUT's body is counted down by
-``Content-Length`` and discarded as it streams past, keeping the stream
-aligned. A zero-length packet carries no bytes and is dropped silently.
+``CONFIG_RAW_HTTP_HEAD_MAX`` bytes. The server answers **one request per
+client round trip**: once a request is answered, everything already received
+beyond it is dropped, so a client must read the response before sending its
+next request. Bodies are **never** buffered: a refused PUT's body is counted
+down by ``Content-Length`` and discarded as it streams past, keeping the
+stream aligned. A zero-length packet carries no bytes and is dropped
+silently.
 Responses are staged in an internal buffer of ``CONFIG_RAW_HTTP_FILE_CHUNK``
 bytes: the bytes handed to the output callback are valid only during the
 call, so copy or transmit them before returning.
@@ -103,21 +105,26 @@ with the file, 404 (nothing servable at that path), 405 (not a GET), 414
 ``CONFIG_RAW_HTTP_HEAD_MAX``), or 400 (malformed bytes, a chunked body, an
 upgrade or CONNECT - no other protocol is spoken here). An incomplete
 request earns **silence**, not an error: the head completes whenever its
-bytes arrive, like on any HTTP server. Pipelining works - several requests
-in one packet are answered in order. Unparseable bytes cost a single 400 and
-a buffer reset; the stream self-heals at the next parseable request (the
-refused request's own tail may earn one follow-up 400), so the client's
-request/response accounting never desynchronises for long.
+bytes arrive, like on any HTTP server. Pipelining is not: one request is
+answered per round trip, and a request sent ahead of the previous response
+is dropped, never answered - its tail may later parse alone as garbage and
+earn a stray 400, from which the stream self-heals. Unparseable bytes
+likewise cost a single 400 and a buffer reset; the stream self-heals at the
+next parseable request (the refused request's own tail may earn one
+follow-up 400), so the client's request/response accounting never
+desynchronises for long.
 
 How it works
 ************
 
-Each packet's bytes go through three consumers in turn: bytes still owed to
-an answered request's body are discarded first, the rest is appended to the
-head assembly buffer, and every request head that completes is answered on
-the spot. Parsing re-runs from the buffer start with a **freshly
-reinitialised parser** on every attempt, so no parser state ever spans
-packets. Only two callbacks are registered:
+Each packet is consumed loop-free: bytes still owed to the previously
+answered request's body are discarded off the front, what fits of the rest
+is appended to the head assembly buffer, and **one** parse attempt is made -
+on success the request is answered and the packet's remainder is dropped
+(discounted against the body debt first, since it may be the answered
+request's own body), so at most one response leaves per packet. Each attempt
+parses the buffer from the start with a **freshly reinitialised parser**, so
+no parser state ever spans packets. Only two callbacks are registered:
 
 * ``on_url`` accumulates the (possibly split) URL, and fails the parse if it
   outgrows ``CONFIG_RAW_HTTP_URL_MAX`` rather than truncating silently;
