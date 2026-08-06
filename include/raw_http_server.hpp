@@ -144,10 +144,13 @@ class RawHttpServer {
 
  private:
   /**
-   * @brief Parser callback: accumulate the (possibly split) URL.
+   * @brief Parser callback: capture the URL.
    *
-   * Fails the parse on overflow - process_request() reads that back as
-   * HPE_CB_url and answers 414 rather than truncating silently.
+   * Called at most once per parse attempt - a URL split across packets
+   * is re-seen whole here on the next attempt, because every attempt
+   * re-parses from the buffer start. Fails the parse on overflow -
+   * process_request() reads that back as HPE_CB_url and answers 414
+   * rather than truncating silently.
    */
   static int on_url(struct http_parser* parser, const char* at, size_t length);
 
@@ -179,15 +182,29 @@ class RawHttpServer {
   /**
    * @brief Feed one packet of stream bytes through the server.
    *
-   * Body bytes owed to the previously answered request are discarded
-   * first (_skip), what fits of the rest is appended to _request_buf
-   * and process_request() makes one parse attempt. A head that
-   * outgrows a full buffer is answered with 431 and the buffer reset.
-   * Once a request is answered the packet's remainder is dropped -
-   * discounted against _skip first, since it may be that request's
-   * own body - so at most one response leaves per packet.
+   * Two consumers take the packet in order: discard() strips body
+   * bytes owed to the previously answered request off the front, then
+   * what fits of the rest is appended to _request_buf and
+   * process_request() makes one parse attempt. A head that outgrows a
+   * full buffer is answered with 431 and the buffer reset. Once a
+   * request is answered the packet's remainder is dropped - through
+   * discard() again, since it may be that request's own body - so at
+   * most one response leaves per packet.
    */
   void handle_packet(const struct net_buf* packet);
+
+  /**
+   * @brief Pay down the answered request's body debt from stream bytes.
+   *
+   * Consumes up to @p available bytes against _body_to_discard. This is
+   * the only place the debt is ever decremented, so every discard site
+   * reads identically - and the size_t/uint64_t care lives here alone
+   * (the debt can exceed SIZE_MAX on 32-bit targets).
+   *
+   * @param available Contiguous stream bytes on offer.
+   * @return How many of them the debt consumed (at most @p available).
+   */
+  size_t discard(size_t available);
 
   /**
    * @brief One parse attempt over _request_buf; answer if it completes.
@@ -200,9 +217,10 @@ class RawHttpServer {
    * still incomplete (wait for more bytes), HPE_CB_url is an overlong
    * URL (414), anything else is malformed bytes (400). On success the
    * request is answered (upgrade/CONNECT 400, chunked 400, non-GET
-   * 405, GET served), the buffer is reset - dropping any bytes beyond
-   * the head - and the body remainder still in flight is scheduled
-   * for discard via _skip.
+   * 405, GET served), the full Content-Length is armed as
+   * _body_to_discard, the bytes already buffered past the head pay it
+   * down through discard() - they are dropped with the buffer reset -
+   * and the body remainder still in flight is discarded on arrival.
    *
    * @return true if a response was sent, false if the head is still
    *         incomplete.
@@ -243,11 +261,10 @@ class RawHttpServer {
   size_t _request_len{0};
 
   /** Body bytes still owed to an answered request, discarded on arrival. */
-  uint64_t _skip{0};
+  uint64_t _body_to_discard{0};
 
   /* Per-parse state, reset by process_request() before each attempt. */
   char _url[CONFIG_RAW_HTTP_URL_MAX]{};
-  size_t _url_len{0};
 };
 
 #endif /* RAW_HTTP_SERVER_HPP_ */

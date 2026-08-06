@@ -24,7 +24,7 @@ namespace {
 
 // Not an HTTP limit - the protocol has none. Worst case of the head format in
 // respond(): "HTTP/1.1 500 Internal Server Error" + CRLF + "Content-Length: "
-// with a 20-digit 64-bit size + closing CRLFs = 76 chars, 77 with the NUL.
+// with a 20-digit 64-bit size + closing CRLFs = 76 chars, 77 with the NULL.
 constexpr size_t response_head_max = 96;
 
 BUILD_ASSERT(CONFIG_RAW_HTTP_FILE_CHUNK >= (int)response_head_max,
@@ -114,21 +114,33 @@ void RawHttpServer::run_loop() {
   }
 }
 
+size_t RawHttpServer::discard(size_t available) {
+  // MIN in the debt's 64-bit width (it may exceed SIZE_MAX); the result
+  // is bounded by available, so the cast back to size_t is safe.
+  size_t paid = (size_t)MIN((uint64_t)available, _body_to_discard);
+
+  _body_to_discard -= paid;
+  return paid;
+}
+
 void RawHttpServer::handle_packet(const struct net_buf* packet) {
+  const uint8_t* data = packet->data;
+  size_t len = packet->len;
+
   // Bytes owed to an answered request's body are not ours to parse:
-  // count them down and drop them without ever buffering them.
-  size_t off = (size_t)MIN((uint64_t)packet->len, _skip);
+  // they pay the debt off the packet front, never buffered.
+  size_t skipped = discard(len);
 
-  _skip -= off;
+  data += skipped;
+  len -= skipped;
 
-  if (off == packet->len) {
+  if (len == 0) {
     return;
   }
 
-  size_t space = sizeof(_request_buf) - _request_len;
-  size_t take = MIN(space, packet->len - off);
+  size_t take = MIN(sizeof(_request_buf) - _request_len, len);
 
-  memcpy(_request_buf + _request_len, packet->data + off, take);
+  memcpy(_request_buf + _request_len, data, take);
   _request_len += take;
 
   bool answered = process_request();
@@ -141,20 +153,16 @@ void RawHttpServer::handle_packet(const struct net_buf* packet) {
     _request_len = 0;
   }
 
-  // One request per round trip: the rest of the packet is dropped. It
-  // must still be discounted against _skip - if the head completed
-  // exactly as the buffer filled, this remainder is the answered
-  // request's own body, not future request bytes.
-  size_t remainder = packet->len - off - take;
-
-  _skip -= MIN(_skip, (uint64_t)remainder);
+  // One request per round trip: the rest of the packet is dropped. If
+  // the head completed exactly as the buffer filled, this remainder is
+  // the answered request's own body, so it too pays the debt.
+  discard(len - take);
 }
 
 bool RawHttpServer::process_request() {
   // A fresh parse from the buffer start each time: no parser state
   // survives between attempts, so packet boundaries cannot matter.
   http_parser_init(&_parser, HTTP_REQUEST);
-  _url_len = 0;
   _url[0] = '\0';
 
   size_t parsed = http_parser_execute(
@@ -223,15 +231,14 @@ bool RawHttpServer::process_request() {
     send_file();
   }
 
-  // Answered: drop everything buffered beyond the head - body bytes
-  // and early next-request bytes alike. Only the body remainder still
-  // in flight is owed to _skip. No Content-Length header parses as
-  // the all-ones sentinel (the parser's ULLONG_MAX) = no body.
-  uint64_t body =
+  // Answered: the full body length becomes the discard debt (no
+  // Content-Length header parses as the all-ones sentinel, the parser's
+  // ULLONG_MAX = no body). The bytes already buffered past the head are
+  // dropped with the reset below, so they pay the debt first; the rest
+  // is discarded as it streams in.
+  _body_to_discard =
       _parser.content_length == UINT64_MAX ? 0 : _parser.content_length;
-  size_t extra = _request_len - head_len;
-
-  _skip = body > extra ? body - extra : 0;
+  discard(_request_len - head_len);
   _request_len = 0;
 
   return true;
@@ -242,16 +249,19 @@ int RawHttpServer::on_url(struct http_parser* parser,
                           size_t length) {
   RawHttpServer* self = static_cast<RawHttpServer*>(parser->data);
 
+  // The vendored parser fires this at most once per execute on a
+  // freshly initialised parse (one URL mark, flushed at end of data),
+  // so the span always starts at the URL's first byte.
+  //
   // Refuse an oversized URL rather than truncating, which would
   // silently address the wrong file. Failing the parse here surfaces
   // as HPE_CB_url, which process_request() answers with 414.
-  if (self->_url_len + length >= sizeof(self->_url)) {
+  if (length >= sizeof(self->_url)) {
     return -1;
   }
 
-  memcpy(self->_url + self->_url_len, at, length);
-  self->_url_len += length;
-  self->_url[self->_url_len] = '\0';
+  memcpy(self->_url, at, length);
+  self->_url[length] = '\0';
 
   return 0;
 }

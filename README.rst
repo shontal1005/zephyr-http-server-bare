@@ -126,8 +126,10 @@ request's own body), so at most one response leaves per packet. Each attempt
 parses the buffer from the start with a **freshly reinitialised parser**, so
 no parser state ever spans packets. Only two callbacks are registered:
 
-* ``on_url`` accumulates the (possibly split) URL, and fails the parse if it
-  outgrows ``CONFIG_RAW_HTTP_URL_MAX`` rather than truncating silently;
+* ``on_url`` captures the URL (a URL split across packets is simply re-seen
+  whole on the next attempt, since every attempt re-parses from the buffer
+  start), and fails the parse if it outgrows ``CONFIG_RAW_HTTP_URL_MAX``
+  rather than truncating silently;
 * ``on_headers_complete`` deliberately returns -1 to **halt the parser** at
   the end of the head - the head is everything a GET-only server needs, so
   the body is never parsed (0, 1 and 2 are magic values to this callback;
