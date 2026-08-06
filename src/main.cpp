@@ -14,6 +14,7 @@
  * UART. GET downloads a file, PUT and POST upload one.
  */
 
+#include <errno.h>
 #include <string.h>
 
 #include <zephyr/fs/fs.h>
@@ -61,14 +62,15 @@ static int seed_demo_file(void) {
   ret = fs_write(&file, body, sizeof(body) - 1);
   (void)fs_close(&file);
 
+  /* A short write (e.g. no free space) would silently truncate the demo. */
+  if (ret >= 0 && ret != (int)(sizeof(body) - 1)) {
+    return -EIO;
+  }
+
   return ret < 0 ? ret : 0;
 }
 
-/* Packets carrying request bytes into the server. The server also stages
- * response data in a request's own packet, so buffers must hold at least
- * RawHttpServer::response_head_max bytes - beyond that the size is a
- * throughput knob: it bounds the download chunk per output callback.
- */
+/* Packet size only sets how RX bytes are chunked on the way to the server. */
 #define HTTP_PACKET_SIZE 1024
 #define HTTP_PACKET_COUNT 8
 
@@ -77,9 +79,6 @@ NET_BUF_POOL_DEFINE(http_packet_pool,
                     HTTP_PACKET_SIZE,
                     0,
                     NULL);
-
-BUILD_ASSERT(HTTP_PACKET_SIZE >= RawHttpServer::response_head_max,
-             "Packets must be able to stage a response head");
 
 /* The UART carrying HTTP. Constructing the bridge starts the server's thread,
  * which is safe at namespace scope; the UART side happens in start().

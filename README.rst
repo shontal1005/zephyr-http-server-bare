@@ -21,9 +21,9 @@ The application-facing surface is a single C++ class, ``RawHttpServer``:
 
    NET_BUF_POOL_DEFINE(my_pool, 8, 1024, 0, NULL);
 
-   static void to_my_link(struct net_buf *packet, size_t len, void *user)
+   static void to_my_link(const uint8_t *data, size_t len, void *user)
    {
-           my_link_write(packet->data, len);        /* bytes out of the server */
+           my_link_write(data, len);                /* bytes out of the server */
    }
 
    /* second argument is the already-mounted directory files live in */
@@ -37,9 +37,12 @@ Constructing the server starts its thread; there is nothing else to start.
 ``enqueue_packet()`` only queues - it is safe from any thread or ISR - and the
 server's thread parses each packet in arrival order, emitting the response
 through the output callback before taking the next: requests are never handled
-in parallel. The response is staged in the request's own packet, so the
-callback must copy or transmit the bytes before returning, and pool buffers
-must hold at least ``RawHttpServer::response_head_max`` (96) bytes.
+in parallel. Responses are staged in an internal buffer of
+``CONFIG_RAW_HTTP_FILE_CHUNK`` bytes, never in the request's packet: the bytes
+handed to the output callback are valid only during the call, so copy or
+transmit them before returning. Because the packet is never reused for the
+response, one packet may carry several pipelined requests, each answered in
+order as the parser reaches it.
 ``RawHttpServer`` knows nothing about UARTs. :file:`src/uart_bridge.cpp` is a
 separate class that connects the two, and is easy to replace with a USB
 endpoint, shared memory or a test harness.
@@ -74,9 +77,9 @@ server never mounts anything itself. Files are served under ``/files/``:
    PUT  /files/report.bin      upload the request body to that path
    POST /files/report.bin      same as PUT
 
-Downloads stream in chunks staged in the request's own packet - the smaller of
-the packet buffer's capacity and ``CONFIG_RAW_HTTP_FILE_CHUNK`` per callback -
-so file size is not bounded by RAM. The size comes from :c:func:`fs_stat`, so
+Downloads stream in chunks staged in the server's internal buffer -
+``CONFIG_RAW_HTTP_FILE_CHUNK`` bytes per output callback - so file size is not
+bounded by RAM. The size comes from :c:func:`fs_stat`, so
 responses carry a plain ``Content-Length`` - no chunked encoding. Uploads work
 the same way in reverse: body fragments are written to the file straight out of
 the request packet as the parser delivers them, so they are not bounded
@@ -89,29 +92,33 @@ No connection to lose
 HTTP/1.1 keep-alive falls out of the design instead of being engineered in:
 there is no connection object anywhere, just a resumable parser on a byte
 stream. Requests may be split across any number of packets. A malformed request
-is answered with a 400 and the parser resets - nothing is lost beyond the
-malformed bytes themselves. The one thing a packet must not carry is a
-pipelined next request behind a complete one: the buffer is reused for the
-response, so those bytes are dropped (loudly). A client that waits for each
-response - which this request/response transport implies anyway - never hits
-this.
+is answered with a single 400 and the parser resets; the rest of that broken
+request keeps arriving as more unparseable packets, and those are discarded
+silently - one response per failure burst, so the client's request/response
+accounting never desynchronises. Upgrade and CONNECT requests are answered 400
+too (no other protocol is spoken here). Pipelining works: one packet may carry
+several complete requests, and each is answered in order as the parser reaches
+it - responses are staged in the server's own buffer, never in the packet
+being parsed.
 
 How it works
 ************
 
 :c:func:`http_parser_execute` is a resumable, byte-at-a-time parser: feed it
-whatever arrived and it fires callbacks at message boundaries. Four of them do
+whatever arrived and it fires callbacks at message boundaries. Five of them do
 all the work:
 
+* ``on_message_begin`` marks a request in flight;
 * ``on_url`` accumulates the (possibly split) URL;
-* ``on_headers_complete`` opens the destination file for PUT/POST;
+* ``on_headers_complete`` refuses upgrades with a 400 and opens the
+  destination file for PUT/POST;
 * ``on_body`` appends each body fragment to that file;
-* ``on_message_complete`` pauses the parser - the answer is deferred until
-  :c:func:`http_parser_execute` has returned, because the response is staged
-  in the very packet the parser is still reading.
+* ``on_message_complete`` answers directly from the server's internal staging
+  buffer - safe even though the parser may keep reading the same packet, and
+  what serves pipelined requests in order.
 
-The server thread then answers: it streams the file back for GET, closes and
-returns 201 for uploads, or emits the recorded error status.
+The answer streams the file back for GET, closes and returns 201 for uploads,
+or emits the recorded error status.
 
 There are no sockets and no state machine beyond the parser's own. The class
 owns one thread, one packet queue and one file handle - and no mutex: the
@@ -225,10 +232,10 @@ device is opened raw, which is all a pseudoterminal needs.
 Things to watch out for
 ***********************
 
-* The output callback runs on the server's thread, and the ``net_buf`` it
-  receives is the request's own packet about to be reused: copy or transmit
-  the bytes before returning. Blocking there is fine - it is the natural flow
-  control against a slow link.
+* The output callback runs on the server's thread, and the bytes it receives
+  are valid only during the call: copy or transmit them before returning.
+  Blocking there is fine - it is the natural flow control against a slow
+  link.
 * Never assume a fixed callback size: one response may arrive over several
   calls, and ``len`` is whatever the server produced in one go.
 * ``Expect: 100-continue`` is not implemented. Clients that send it (curl does
@@ -239,10 +246,17 @@ Things to watch out for
 * ``UartBridge`` transmits with :c:func:`uart_poll_out`, which busy-waits per
   byte. That is fine at sane baud rates; switch to interrupt-driven TX if you
   push large responses at high speed.
-* If the UART RX ring (``UART_BRIDGE_RING_SIZE``) overflows, bytes are dropped
-  and the request stream desynchronises. The bridge logs an error when that
-  happens. At any real baud rate the feed thread drains far faster than bytes
-  arrive.
+* If the UART RX ring (``UART_BRIDGE_RING_SIZE``) overflows, bytes are
+  dropped: the bridge logs the exact count and sends the server a stream-break
+  marker (a zero-length packet). The server then fails any request in flight
+  with a 400 and resets the parser, instead of silently sewing later bytes
+  into a half-received upload. At any real baud rate the feed thread drains
+  far faster than bytes arrive.
+* An aborted upload (parser failure mid-body, stream break, or a write/close
+  error) deletes the partial file - the old content was already truncated away
+  at open, and an honest 404 beats serving a corrupt file with a 200. A failed
+  ``fs_close()`` (e.g. ``-ENOSPC`` on the final flush) is answered 500, not
+  201.
 * On ``native_sim`` that overflow is easy to trip artificially: a
   pseudoterminal has no baud rate, and native_pty's interrupt-emulation thread
   runs at ``K_HIGHEST_THREAD_PRIO`` without sleeping. Pace host writes for

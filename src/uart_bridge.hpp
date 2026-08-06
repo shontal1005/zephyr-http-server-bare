@@ -20,6 +20,7 @@
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net_buf.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/ring_buffer.h>
 
 #include <raw_http_server.hpp>
@@ -32,9 +33,9 @@ class UartBridge {
   /**
    * @param uart The UART carrying the HTTP byte stream.
    * @param fs_root Already-mounted directory files are served from.
-   * @param pool Pool the request packets are allocated from. Buffers
-   *             must hold at least RawHttpServer::response_head_max
-   *             bytes; the server frees each packet when done with it.
+   * @param pool Pool the request packets are allocated from; the
+   *             buffer size only sets how RX bytes are chunked. The
+   *             server frees each packet when done with it.
    */
   UartBridge(const struct device* uart,
              const char* fs_root,
@@ -61,7 +62,7 @@ class UartBridge {
    * Recovers the UartBridge from @p user_data and forwards to
    * write_to_uart().
    */
-  static void on_server_output(struct net_buf* packet,
+  static void on_server_output(const uint8_t* data,
                                size_t len,
                                void* user_data);
 
@@ -112,6 +113,8 @@ class UartBridge {
   struct ring_buf _rx_ring{};
   /** Absorbs bytes arriving while the packet pool is exhausted. */
   uint8_t _rx_ring_buf[UART_BRIDGE_RING_SIZE]{};
+  /** ISR sets this on ring overflow; the feed thread sends the marker. */
+  atomic_t _rx_overflowed{0};
   struct k_sem _rx_sem{};
   struct k_thread _feed_thread{};
 };

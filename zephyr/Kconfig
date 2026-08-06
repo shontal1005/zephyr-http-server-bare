@@ -44,10 +44,11 @@ config RAW_HTTP_FILE_CHUNK
 	int "Bytes read from the filesystem per output callback"
 	default 1600
 	help
-	  Download chunks are staged in the request's own packet buffer, so
-	  the effective chunk is the smaller of this and the net_buf pool's
-	  buffer size. Uploads do not use this - body fragments are written
-	  to the file straight from the request packet.
+	  Responses - heads and download chunks alike - are staged in an
+	  internal buffer of this size, so it costs this many bytes per
+	  server instance. Must be at least 96, the longest response head.
+	  Uploads do not use this - body fragments are written to the file
+	  straight from the request packet.
 
 config RAW_HTTP_THREAD_STACK_SIZE
 	int "Server thread stack size"

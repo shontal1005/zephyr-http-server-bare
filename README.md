@@ -20,9 +20,9 @@ else to start:
 ```cpp
 NET_BUF_POOL_DEFINE(my_pool, 8, 1024, 0, NULL);
 
-static void to_my_link(struct net_buf *packet, size_t len, void *user)
+static void to_my_link(const uint8_t *data, size_t len, void *user)
 {
-        my_link_write(packet->data, len);        // bytes out of the server
+        my_link_write(data, len);                // bytes out of the server
 }
 
 // second argument is the already-mounted directory files live in
@@ -39,13 +39,12 @@ each packet in arrival order and emits the response through the output callback
 before taking the next, so requests are never handled in parallel. A packet
 arriving while a response is still streaming simply waits in the queue.
 
-The response is staged in the request's own packet: the `net_buf` that
-completed a request is cleared and refilled for every output callback of that
-response, then released. The callback must therefore copy or transmit the
-bytes before it returns. Because the server owns each packet from
-`enqueue_packet()` on, buffers must hold at least
-`RawHttpServer::response_head_max` (96) bytes so a response head can be staged
-in place.
+Responses are staged in an internal buffer of `CONFIG_RAW_HTTP_FILE_CHUNK`
+bytes, never in the request's packet. The bytes handed to the output callback
+are valid only during the call — copy or transmit them before returning. And
+because the packet is never reused for the response, one packet may carry
+several pipelined requests: each is answered in order as the parser reaches
+it.
 
 `RawHttpServer` knows nothing about UARTs —
 [`src/uart_bridge.cpp`](src/uart_bridge.cpp) is a separate class that wires the
@@ -79,7 +78,7 @@ the configuration notes). Everything tunable is a Kconfig option:
 | `CONFIG_RAW_HTTP_FILES_PREFIX` | `/files/` | URL prefix files are served under |
 | `CONFIG_RAW_HTTP_URL_MAX` | 160 | longest accepted URL (414 beyond) |
 | `CONFIG_RAW_HTTP_PATH_MAX` | 256 | longest filesystem path built |
-| `CONFIG_RAW_HTTP_FILE_CHUNK` | 1600 | download bytes read per output callback |
+| `CONFIG_RAW_HTTP_FILE_CHUNK` | 1600 | response staging buffer per instance; download bytes read per output callback |
 | `CONFIG_RAW_HTTP_THREAD_STACK_SIZE` | 4096 | the server thread's stack |
 | `CONFIG_RAW_HTTP_THREAD_PRIORITY` | 9 | the server thread's priority |
 | `CONFIG_RAW_HTTP_LOG_LEVEL` | inf | standard per-module log level |
@@ -95,8 +94,8 @@ PUT  /files/report.bin      upload the request body to that path
 POST /files/report.bin      same as PUT
 ```
 
-Downloads stream in chunks staged in the request's own packet — the smaller of
-the packet buffer's capacity and `CONFIG_RAW_HTTP_FILE_CHUNK` per callback — so
+Downloads stream in chunks staged in the server's internal buffer —
+`CONFIG_RAW_HTTP_FILE_CHUNK` bytes per output callback — so
 file size is not bounded by RAM; the size comes from `fs_stat()`, so responses
 carry a plain `Content-Length` — no chunked encoding, and a progress bar knows
 the total up front. Uploads work the same way in reverse: body fragments are
@@ -109,28 +108,32 @@ is rejected, and the stream just keeps serving.
 HTTP/1.1 keep-alive falls out of the design instead of being engineered in:
 there is no connection object anywhere, just a resumable parser on a byte
 stream. Requests may be split across any number of packets. A malformed request
-is answered with a 400 and the parser resets — nothing is lost beyond the
-malformed bytes themselves. The one thing a packet must not carry is a
-pipelined *next* request behind a complete one: the buffer is reused for the
-response, so those bytes are dropped (loudly). A client that waits for each
-response — which this request/response transport implies anyway — never hits
-this.
+is answered with a **single** 400 and the parser resets; the rest of that
+broken request keeps arriving as more unparseable packets, and those are
+discarded silently — one response per failure burst, so the client's
+request/response accounting never desynchronises. Upgrade and CONNECT requests
+are answered 400 too (no other protocol is spoken here). Pipelining works: one
+packet may carry several complete requests, and each is answered in order as
+the parser reaches it — responses are staged in the server's own buffer, never
+in the packet being parsed.
 
 ## How it works
 
 `http_parser_execute()` is a resumable, byte-at-a-time parser: feed it whatever
-arrived and it fires callbacks at message boundaries. Four of them do all the
+arrived and it fires callbacks at message boundaries. Five of them do all the
 work:
 
+- `on_message_begin` marks a request in flight
 - `on_url` accumulates the (possibly split) URL
-- `on_headers_complete` opens the destination file for PUT/POST
+- `on_headers_complete` refuses upgrades with a 400 and opens the destination
+  file for PUT/POST
 - `on_body` appends each body fragment to that file
-- `on_message_complete` pauses the parser — the answer is deferred until
-  `http_parser_execute()` has returned, because the response is staged in the
-  very packet the parser is still reading
+- `on_message_complete` answers directly from the server's internal staging
+  buffer — safe even though the parser may keep reading the same packet, and
+  what serves pipelined requests in order
 
-The server thread then answers: it streams the file back for GET, closes and
-201s for uploads, or emits the recorded error status.
+The answer streams the file back for GET, closes and 201s for uploads, or
+emits the recorded error status.
 
 There are no sockets and no state machine beyond the parser's own. The class
 owns one thread, one packet queue and one file handle — and **no mutex**: the
@@ -265,14 +268,12 @@ its network driver.
 
 ## Things to watch out for
 
-- The output callback runs on the **server's thread**, and the `net_buf` it
-  receives is the request's own packet about to be reused: copy or transmit
-  the bytes before returning. Blocking there is fine — it is the natural flow
-  control against a slow link.
+- The output callback runs on the **server's thread**, and the bytes it
+  receives are valid only during the call: copy or transmit them before
+  returning. Blocking there is fine — it is the natural flow control against a
+  slow link.
 - Never assume a fixed callback size: one response may arrive over several
   calls, and `len` is whatever the server produced in one go.
-- Packet buffers must hold at least `RawHttpServer::response_head_max` (96)
-  bytes, since response heads are staged in them.
 - `Expect: 100-continue` is not implemented. Clients that send it (curl does
   for large uploads) will pause briefly before sending the body; pass
   `-H 'Expect:'` to avoid the delay.
@@ -281,9 +282,17 @@ its network driver.
 - `UartBridge` transmits with `uart_poll_out()`, which busy-waits per byte.
   Fine at sane baud rates; switch to interrupt-driven TX if you push large
   responses at high speed.
-- If the UART RX ring (`UART_BRIDGE_RING_SIZE`) overflows, bytes are dropped
-  and the request stream desynchronises. The bridge logs an error. At any real
-  baud rate the feed thread drains far faster than bytes arrive.
+- If the UART RX ring (`UART_BRIDGE_RING_SIZE`) overflows, bytes are dropped:
+  the bridge logs the exact count and sends the server a **stream-break
+  marker** (a zero-length packet). The server then fails any request in
+  flight with a 400 and resets the parser, instead of silently sewing later
+  bytes into a half-received upload. At any real baud rate the feed thread
+  drains far faster than bytes arrive.
+- An aborted upload (parser failure mid-body, stream break, or a write/close
+  error) **deletes** the partial file — the old content was already truncated
+  away at open, and an honest 404 beats serving a corrupt file with a 200.
+  A failed `fs_close()` (e.g. `-ENOSPC` on the final flush) is answered 500,
+  not 201.
 - On `native_sim` that overflow is easy to trip artificially: a pseudoterminal
   has no baud rate, and native_pty's interrupt-emulation thread runs at
   `K_HIGHEST_THREAD_PRIO` without sleeping. Pace host writes for large uploads

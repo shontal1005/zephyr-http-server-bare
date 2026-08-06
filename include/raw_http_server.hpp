@@ -28,9 +28,9 @@
  * @code
  * NET_BUF_POOL_DEFINE(my_pool, 8, 1024, 0, NULL);
  *
- * static void to_my_link(struct net_buf *packet, size_t len, void *user)
+ * static void to_my_link(const uint8_t *data, size_t len, void *user)
  * {
- *         my_link_write(packet->data, len);
+ *         my_link_write(data, len);
  * }
  *
  * static RawHttpServer server(to_my_link, "/lfs");
@@ -65,10 +65,9 @@
  * needs no lock. enqueue_packet() only touches the packet queue and may be
  * called from any thread or from an ISR.
  *
- * The response is staged in the request's own packet: the net_buf that
- * completed a request is reused, cleared and refilled for every output
- * callback of that response, and released when the response is done. A fresh
- * packet is only ever taken from the queue for new request bytes.
+ * Responses are staged in an internal buffer of CONFIG_RAW_HTTP_FILE_CHUNK
+ * bytes, never in the request's packet - so a packet may carry several
+ * pipelined requests, each answered in order as the parser reaches it.
  */
 class RawHttpServer {
  public:
@@ -82,27 +81,16 @@ class RawHttpServer {
    *       several calls. Never assume a fixed size - @p len is whatever
    *       the server produced in one go.
    *
-   * @note @p packet is the very net_buf the request arrived in, reused
-   *       as the staging area for the whole response. The callback must
-   *       copy or transmit the bytes before returning: the server clears
-   *       and refills the buffer for the next piece of the response.
+   * @note The bytes are valid only during the call: copy or transmit
+   *       them before returning.
    *
-   * @param packet Buffer holding the bytes to transmit. Never nullptr.
-   * @param len Valid bytes in @p packet (equals packet->len). Never 0.
+   * @param data Bytes to transmit. Never nullptr.
+   * @param len Number of valid bytes at @p data. Never 0.
    * @param user_data The pointer handed to the constructor.
    */
-  using OutputCallback = void (*)(struct net_buf* packet,
+  using OutputCallback = void (*)(const uint8_t* data,
                                   size_t len,
                                   void* user_data);
-
-  /**
-   * @brief Longest response head the server emits, NUL included.
-   *
-   * Packet buffers double as the response staging area, so every buffer
-   * handed to enqueue_packet() must have room for at least this many
-   * bytes - size your net_buf pool accordingly.
-   */
-  static constexpr size_t response_head_max = 96;
 
   /**
    * @brief Construct the server and start its thread.
@@ -118,28 +106,32 @@ class RawHttpServer {
                 const char* fs_root,
                 void* user_data = nullptr);
 
+  /**
+   * @brief Stop the server thread and release everything it held.
+   *
+   * Best-effort: destroying mid-request simply drops that exchange.
+   */
+  ~RawHttpServer();
+
   RawHttpServer(const RawHttpServer&) = delete;
   RawHttpServer& operator=(const RawHttpServer&) = delete;
 
   /**
    * @brief Hand a packet of raw request bytes to the server.
    *
-   * The packet does not have to hold a whole request: the parser
-   * consumes a byte stream, and a request may span any number of
-   * packets. The server thread parses each packet in arrival order and
-   * emits the response through the output callback before it takes the
-   * next packet - requests are never handled in parallel.
+   * The parser consumes a byte stream: a request may span any number of
+   * packets, and one packet may carry several pipelined requests - each
+   * is answered in order. Ownership of @p packet passes to the server
+   * (and stays with the caller on error). Flat buffers only - fragment
+   * chains are rejected.
    *
-   * Ownership of @p packet passes to the server, which releases it back
-   * to its pool when done. Bytes following a completed request inside
-   * the same packet (a pipelined next request) are dropped with a
-   * warning: the buffer is reused for the response. On this
-   * request/response transport a client waits for the answer before
-   * sending more, so nothing well-behaved ever hits this.
+   * A zero-length packet is the in-band stream-break marker: the
+   * transport lost bytes, so any request in flight is failed with a
+   * 400 and the parser resets.
    *
    * Safe to call from any thread or from an ISR.
    *
-   * @return 0 on success, -EINVAL on a nullptr packet.
+   * @return 0 on success, -EINVAL on a nullptr or chained packet.
    */
   int enqueue_packet(struct net_buf* packet);
 
@@ -147,6 +139,14 @@ class RawHttpServer {
   const char* fs_root() const { return _fs_root; }
 
  private:
+  /**
+   * @brief Parser callback: a new request has started.
+   *
+   * Marks a request in flight; reset_request() clears the mark, so the
+   * pair keeps _request_active exact across any packet fragmentation.
+   */
+  static int on_message_begin(struct http_parser* parser);
+
   /**
    * @brief Parser callback: accumulate the (possibly split) URL.
    *
@@ -159,9 +159,11 @@ class RawHttpServer {
   /**
    * @brief Parser callback: the request head is complete.
    *
-   * For PUT and POST this opens the destination file, so that body
-   * fragments can be written straight through as they arrive. Any other
-   * method than GET/PUT/POST fails the request with a 405.
+   * An upgrade (CONNECT, Upgrade:) is refused with a 400 - no other
+   * protocol is spoken here. For PUT and POST this opens the
+   * destination file, so that body fragments can be written straight
+   * through as they arrive. Any other method than GET/PUT/POST fails
+   * the request with a 405.
    */
   static int on_headers_complete(struct http_parser* parser);
 
@@ -175,13 +177,11 @@ class RawHttpServer {
   static int on_body(struct http_parser* parser, const char* at, size_t length);
 
   /**
-   * @brief Parser callback: the request is complete - pause the parser.
+   * @brief Parser callback: the request is complete - answer it.
    *
-   * The answer is deliberately not emitted here: the response is staged
-   * in the very packet the parser is still reading, so it must not be
-   * overwritten mid-parse. Pausing makes http_parser_execute() return
-   * with HPE_PAUSED, and process_packet() answers once the packet's
-   * bytes are no longer needed.
+   * The response is staged in _out_buf, not in the packet the parser
+   * is reading, so answering inline is safe - and it is what serves
+   * pipelined requests in order, one answer per completed message.
    */
   static int on_message_complete(struct http_parser* parser);
 
@@ -201,15 +201,30 @@ class RawHttpServer {
   void run_loop();
 
   /**
-   * @brief Parse one packet and answer any request it completes.
+   * @brief Parse one packet; completed requests are answered inline.
    *
-   * Feeds the packet to the parser. If on_message_complete() paused the
-   * parser, the request's bytes are consumed and the packet is free:
-   * answer() reuses it for the response. Garbage gets a 400 and a
-   * parser reset; a packet holding only a request fragment produces no
-   * output at all.
+   * on_message_complete() answers each request the packet completes.
+   * An upgrade's foreign-protocol remainder is dropped, garbage goes
+   * to fail_stream(), a zero-length packet to handle_stream_break(),
+   * and a clean fragment produces no output at all.
    */
   void process_packet(struct net_buf* packet);
+
+  /**
+   * @brief Answer 400 once per failure burst, then reset the parser.
+   *
+   * More 400s would sit stale in the client's buffer, misattributed
+   * to its later, valid requests.
+   */
+  void fail_stream(const char* why);
+
+  /**
+   * @brief The transport lost bytes (a zero-length packet arrived).
+   *
+   * A request in flight can never complete: fail it so the client
+   * gets closure. When idle, just reset the parser.
+   */
+  void handle_stream_break();
 
   /**
    * @brief Emit the response for the completed request.
@@ -236,19 +251,31 @@ class RawHttpServer {
    *
    * The size comes from fs_stat(), so the response carries a plain
    * Content-Length - no chunked encoding. A file that cannot be opened
-   * or stat'd is a 404. Body chunks are read straight into the request's
-   * packet, one output callback per chunk.
+   * or stat'd is a 404. Body chunks are read into _out_buf, one output
+   * callback per chunk.
    */
   void send_file();
 
-  /** @brief Stage a response head in the packet and emit it. */
+  /** @brief Stage a response head in _out_buf and emit it. */
   void respond(unsigned int status, size_t content_length);
 
-  /** @brief Push the packet's current contents to the output callback. */
-  void send();
+  /**
+   * @brief Delete a failed upload's partial file.
+   *
+   * The old content is already truncated away; an honest 404 beats a
+   * 200 serving a corrupt file.
+   */
+  void abort_upload();
 
   /** @brief Close any open file and clear the per-request state. */
   void reset_request();
+
+  /**
+   * @brief Fresh parser for the next request.
+   *
+   * Clears sticky parser flags (upgrade); the data pointer survives.
+   */
+  void reset_parser();
 
   /** The parser callbacks, shared by every instance. */
   static const struct http_parser_settings _settings;
@@ -264,14 +291,22 @@ class RawHttpServer {
   struct k_thread _thread{};
   K_KERNEL_STACK_MEMBER(_stack, CONFIG_RAW_HTTP_THREAD_STACK_SIZE);
 
-  /** The packet being processed; the response is staged into it. */
-  struct net_buf* _packet{nullptr};
+  /** Response staging: heads and download chunks alike. */
+  uint8_t _out_buf[CONFIG_RAW_HTTP_FILE_CHUNK]{};
+
+  /** A 400 for the current failure burst was already sent. */
+  bool _bad_stream{false};
 
   /* Per-request state, cleared by reset_request(). */
   char _url[CONFIG_RAW_HTTP_URL_MAX]{};
   size_t _url_len{0};
   struct fs_file_t _file{};
   bool _file_open{false};
+  /** A request is mid-parse: on_message_begin() sets, reset_request()
+   * clears. */
+  bool _request_active{false};
+  /** Path of an upload not yet committed; empty when none. */
+  char _upload_path[CONFIG_RAW_HTTP_PATH_MAX]{};
   /** Nonzero once the request has failed; the status to answer with. */
   unsigned int _error_status{0};
 };
