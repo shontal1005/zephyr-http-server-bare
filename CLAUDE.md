@@ -18,6 +18,7 @@ ZEPHYR_BASE=/home/user/dev/zephyr ZEPHYR_TOOLCHAIN_VARIANT=host \
 ninja -C build
 
 # run the simulator; it prints "uart_1 connected to pseudotty: /dev/pts/N"
+# (it persists its flash image as ./flash.bin in the cwd — gitignored)
 build/zephyr/zephyr.exe
 
 # nucleo_u5a5zj_q (Zephyr SDK found via the CMake package registry)
@@ -60,6 +61,6 @@ Use `--device=...` with `=`: a bare path value derails pytest's rootdir detectio
 - All C++ is formatted with `clang-format --style=chromium` (a PostToolUse hook in `.claude/settings.json` formats edited C++ files automatically; Python is exempt).
 - snake_case for methods and variables; private members `_snake_case` (leading underscore); PascalCase only for classes/type aliases.
 - Doxygen on all methods in headers, private ones included; `//` comments in `.cpp` bodies (license headers stay `/* */`); comments stay short and explain only what the code can't.
-- Magic numbers get a named constant with a one-line derivation, in the `.cpp` unless truly public API (see `response_head_max` in `lib/raw_http_server.cpp` for the standard in-`.cpp` case).
+- Magic numbers get a named constant with a one-line derivation in the `.cpp` (see `response_head_max` in `lib/raw_http_server.cpp`); promote to the header only if callers need it.
 - Tunables are Kconfig options (`CONFIG_RAW_HTTP_*`) for the library, plain defines for the sample bridge.
 - README.md is the project-facing doc; README.rst is the upstream-Zephyr-style twin — keep both in sync when behavior changes.
