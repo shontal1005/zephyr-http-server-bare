@@ -12,10 +12,13 @@ send() and receive() - exactly as the C++ class delegates its bytes to an
 output callback and an input() caller. `SerialRawHttpClient` is the UART
 implementation used by this project.
 
+The server serves GET only - anything else is answered with 405 - and
+reassembles the request byte stream itself, so requests may be split or
+batched arbitrarily on the wire.
+
 The file is also a tool::
 
     ./client/raw_http_client.py /dev/pts/9 download hello.txt /tmp/hello.txt
-    ./client/raw_http_client.py /dev/ttyUSB0 upload firmware.bin fw.bin
 """
 
 import argparse
@@ -35,7 +38,7 @@ class RawHttpError(Exception):
 
 
 class RawHttpClient:
-    """Download and upload files over HTTP/1.1 on a raw byte stream.
+    """Download files over HTTP/1.1 on a raw byte stream.
 
     The "connection" is whatever byte pipe the subclass owns, so it never
     opens or closes: every request rides the same stream and responses come
@@ -58,6 +61,9 @@ class RawHttpClient:
         self.prefix = prefix
         self.pace = pace
         self.gap = gap
+        # One receive() may span two responses (pipelining): whatever
+        # follows the response being read stays here for the next read.
+        self._rx = bytearray()
 
     def send(self, data):
         """Write bytes to the link. Override in a subclass."""
@@ -73,9 +79,10 @@ class RawHttpClient:
     def drain(self, settle=0.5):
         """Discard stale bytes until the link is quiet for `settle` seconds.
 
-        At boot the firmware's self-test pushes four responses out the same
+        At boot the firmware's self-test pushes five responses out the same
         link; call this once before the first request.
         """
+        self._rx.clear()
         deadline = time.time() + settle
         while time.time() < deadline:
             if self.receive():
@@ -103,21 +110,15 @@ class RawHttpClient:
             f.write(body)
         return len(body)
 
-    def upload(self, src_path, remote_name):
-        """PUT the contents of `src_path` as `remote_name`.
+    def request(self, raw):
+        """Send one raw request and return ``(status, body)``.
 
-        :raises RawHttpError: unless the server answers 200 or 201
+        No status is an error here - this is how tests assert the
+        refusals (405 for a non-GET, 414 for an overlong URL, 431 for
+        an oversized head, 400 for malformed bytes). download() is the
+        surface meant for real use.
         """
-        with open(src_path, "rb") as f:
-            payload = f.read()
-
-        request = (f"PUT {self.prefix}{remote_name} HTTP/1.1\r\n"
-                   f"Host: raw\r\n"
-                   f"Content-Length: {len(payload)}\r\n\r\n").encode() + payload
-        status, _ = self._round_trip(request)
-
-        if status not in (200, 201):
-            raise RawHttpError(status, f"PUT {remote_name} returned {status}")
+        return self._round_trip(raw)
 
     def _round_trip(self, request):
         """Send one request paced, read one response, return (status, body)."""
@@ -139,33 +140,37 @@ class RawHttpClient:
             time.sleep(self.gap)
 
     def _read_response(self):
-        """Read one response: head up to CRLFCRLF, then Content-Length bytes."""
-        buf = bytearray()
+        """Read one response: head up to CRLFCRLF, then Content-Length bytes.
+
+        Consumes exactly one response from the persistent buffer; bytes
+        beyond it (a pipelined next response) stay for the next call.
+        """
+        buf = self._rx
         deadline = time.time() + self.timeout
         head = None
         length = 0
 
         while time.time() < deadline:
+            if head is None:
+                split, sep, _ = bytes(buf).partition(b"\r\n\r\n")
+                if sep:
+                    head = split
+                    del buf[:len(head) + 4]
+                    for line in head.lower().split(b"\r\n"):
+                        if line.startswith(b"content-length:"):
+                            length = int(line.split(b":", 1)[1])
+                            break
+
+            if head is not None and len(buf) >= length:
+                body = bytes(buf[:length])
+                del buf[:length]
+                return self._status_of(head), body
+
             chunk = self.receive()
             if chunk:
                 buf.extend(chunk)
             else:
                 time.sleep(0.01)
-                continue
-
-            if head is None:
-                split, sep, _ = bytes(buf).partition(b"\r\n\r\n")
-                if not sep:
-                    continue
-                head = split
-                del buf[:len(head) + 4]
-                for line in head.lower().split(b"\r\n"):
-                    if line.startswith(b"content-length:"):
-                        length = int(line.split(b":", 1)[1])
-                        break
-
-            if head is not None and len(buf) >= length:
-                return self._status_of(head), bytes(buf[:length])
 
         raise TimeoutError(f"no complete response within {self.timeout} s")
 
@@ -271,9 +276,6 @@ def main():
     download = sub.add_parser("download", help="GET a remote file")
     download.add_argument("remote", help="remote file name")
     download.add_argument("dest", help="local path to write")
-    upload = sub.add_parser("upload", help="PUT a local file")
-    upload.add_argument("src", help="local file to send")
-    upload.add_argument("remote", help="remote file name")
 
     args = parser.parse_args()
 
@@ -282,12 +284,8 @@ def main():
                              gap=args.gap) as client:
         client.drain()  # boot self-test responses may still be in flight
         try:
-            if args.command == "download":
-                n = client.download(args.remote, args.dest)
-                print(f"{args.remote} -> {args.dest}: {n} bytes")
-            else:
-                client.upload(args.src, args.remote)
-                print(f"{args.src} -> {args.remote}: uploaded")
+            n = client.download(args.remote, args.dest)
+            print(f"{args.remote} -> {args.dest}: {n} bytes")
         except (FileNotFoundError, RawHttpError, TimeoutError) as err:
             sys.exit(f"error: {err}")
 

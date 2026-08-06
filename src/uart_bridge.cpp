@@ -59,8 +59,9 @@ void UartBridge::isr(const struct device* dev) {
     uint32_t put = ring_buf_put(&_rx_ring, buf, read);
 
     if (put < static_cast<uint32_t>(read)) {
-      /* Dropping beats blocking; the flag becomes a stream-break marker. */
-      atomic_set(&_rx_overflowed, 1);
+      /* Dropping beats blocking. The mangled request answers for
+       * itself: it cannot parse, so the server 400s its packet.
+       */
       LOG_ERR("UART RX ring full, %u bytes dropped",
               static_cast<uint32_t>(read) - put);
     }
@@ -93,23 +94,14 @@ void UartBridge::feed_loop() {
 
       net_buf_add(packet, len);
 
-      /* The server owns the packet from here: parse, respond, free. */
+      /* The server owns the packet from here: it reassembles the
+       * byte stream, so how it is chunked here cannot matter.
+       */
       int ret = _server.enqueue_packet(packet);
 
       if (ret < 0) {
         LOG_ERR("Feeding the HTTP server failed (%d)", ret);
         net_buf_unref(packet);
-      }
-    }
-
-    if (atomic_clear(&_rx_overflowed) != 0) {
-      /* Bytes were lost: the zero-length marker makes the server fail
-       * the request in flight instead of sewing later bytes into it.
-       */
-      struct net_buf* marker = net_buf_alloc(_pool, K_FOREVER);
-
-      if (_server.enqueue_packet(marker) < 0) {
-        net_buf_unref(marker);
       }
     }
   }

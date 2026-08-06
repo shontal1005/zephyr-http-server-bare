@@ -16,13 +16,15 @@ startup ("uart_1 connected to pseudotty: /dev/pts/9"), so just pass that path::
 
     ./tests/http_over_serial_test.py /dev/pts/9
 
-Checks, in order:
+The server is GET-only and reassembles the request byte stream itself, so
+how requests are chunked on the wire cannot matter. Checks, in order:
 
-  1. GET  /lfs/hello.txt   downloads the seeded file
-  2. PUT  /lfs/<name>      uploads a generated payload
-  3. GET  /lfs/<name>      reads it back and compares byte for byte
-  4. GET  /lfs/<missing>   returns 404 without dropping the connection
-  5. GET  /lfs/hello.txt   still works, proving keep-alive across all of it
+  1. GET /lfs/hello.txt    downloads the seeded file
+  2. GET /lfs/big.bin      downloads the multi-chunk seed and compares bytes
+  3. PUT /lfs/<name>       is refused with 405 - GET is the whole surface
+  4. GET /lfs/<missing>    returns 404 without dropping the connection
+  5. GET /lfs/hello.txt    split into two writes, reassembled and served
+  6. GET /lfs/hello.txt    still works, proving the stream survived it all
 
 Every request rides the same connection, so a clean run also proves the server
 never hung up. pyserial is used when available (needed to set a baud rate);
@@ -35,6 +37,14 @@ import sys
 import time
 
 DEFAULT_TIMEOUT = 5.0
+
+# Seeded by the firmware at boot; the pattern mirrors main.cpp byte for byte.
+BIG_NAME = "big.bin"
+BIG_SIZE = 5035
+
+
+def big_payload():
+    return bytes((i * 7 + i // 251) & 0xFF for i in range(BIG_SIZE))
 
 
 class Link:
@@ -117,7 +127,7 @@ def send_paced(link, data, pace, gap):
 
 
 def read_response(link, timeout):
-    """Accumulate one HTTP response, using its own framing to know when to stop."""
+    """Read one response: head up to CRLFCRLF, then Content-Length bytes."""
     buf = bytearray()
     deadline = time.time() + timeout
 
@@ -132,42 +142,20 @@ def read_response(link, timeout):
         if not sep:
             continue
 
-        lowered = head.lower()
-        if b"transfer-encoding: chunked" in lowered:
-            if body.endswith(b"0\r\n\r\n") or b"\r\n0\r\n\r\n" in body:
+        length = 0
+        for line in head.lower().split(b"\r\n"):
+            if line.startswith(b"content-length:"):
+                length = int(line.split(b":", 1)[1])
                 break
-        else:
-            length = 0
-            for line in lowered.split(b"\r\n"):
-                if line.startswith(b"content-length:"):
-                    length = int(line.split(b":", 1)[1])
-                    break
-            if len(body) >= length:
-                break
+        if len(body) >= length:
+            break
 
     return bytes(buf)
 
 
 def body_of(response):
-    """Strip the status line, headers and any chunk framing."""
-    head, _, body = response.partition(b"\r\n\r\n")
-
-    if b"transfer-encoding: chunked" not in head.lower():
-        return body
-
-    out, rest = bytearray(), body
-    while True:
-        size_line, _, rest = rest.partition(b"\r\n")
-        try:
-            size = int(size_line.strip() or b"0", 16)
-        except ValueError:
-            break
-        if size == 0:
-            break
-        out.extend(rest[:size])
-        rest = rest[size + 2:]
-
-    return bytes(out)
+    """Strip the status line and headers."""
+    return response.partition(b"\r\n\r\n")[2]
 
 
 def status_of(response):
@@ -184,9 +172,6 @@ def main():
     parser.add_argument("device", help="serial device the board's http-uart is on")
     parser.add_argument("--baud", type=int, default=115200,
                         help="baud rate (needs pyserial; ignored for a pty)")
-    parser.add_argument("--size", type=int, default=5035,
-                        help="upload payload size in bytes")
-    parser.add_argument("--name", default="up.bin", help="filename to upload")
     parser.add_argument("--seeded", default="hello.txt",
                         help="a file expected to already exist under the fs root")
     parser.add_argument("--prefix", default="/lfs/", help="URL prefix files are served under")
@@ -228,33 +213,43 @@ def main():
         else:
             print(f"     body: {body_of(resp)[:60]!r}")
 
-        print("2. upload a payload")
-        payload = bytes(range(32, 127)) * (args.size // 95 + 1)
-        payload = payload[:args.size]
-        upload = (f"PUT {args.prefix}{args.name} HTTP/1.1\r\nHost: bare\r\n"
-                  f"Content-Length: {len(payload)}\r\n\r\n").encode() + payload
-        resp = request(upload, f"PUT {args.name} ({len(payload)} bytes)")
-        if status_of(resp) not in (200, 201):
-            failures.append(f"upload returned {status_of(resp)}, expected 201")
-
-        print("3. read it back and compare")
-        resp = get(args.prefix + args.name, f"GET {args.name}")
+        print("2. download the multi-chunk seed and compare")
+        resp = get(args.prefix + BIG_NAME, f"GET {BIG_NAME}")
         got = body_of(resp)
-        print(f"     got {len(got)} bytes, expected {len(payload)}")
-        if got != payload:
-            where = next((i for i, (a, b) in enumerate(zip(got, payload)) if a != b), len(got))
-            failures.append(f"round-trip mismatch: {len(got)}/{len(payload)} bytes, "
+        expected = big_payload()
+        print(f"     got {len(got)} bytes, expected {len(expected)}")
+        if got != expected:
+            where = next((i for i, (a, b) in enumerate(zip(got, expected)) if a != b), len(got))
+            failures.append(f"big.bin mismatch: {len(got)}/{len(expected)} bytes, "
                             f"first difference at offset {where}")
+
+        print("3. an upload must be refused with 405")
+        upload = (f"PUT {args.prefix}up.bin HTTP/1.1\r\nHost: bare\r\n"
+                  f"Content-Length: 4\r\n\r\nnope").encode()
+        resp = request(upload, "PUT up.bin")
+        if status_of(resp) != 405:
+            failures.append(f"upload returned {status_of(resp)}, expected 405")
 
         print("4. a missing file must 404")
         resp = get(args.prefix + "definitely-not-here.txt", "GET missing")
         if status_of(resp) != 404:
             failures.append(f"missing file returned {status_of(resp)}, expected 404")
 
-        print("5. the connection must have survived all of it")
+        print("5. a request split into two writes must be reassembled")
+        raw = f"GET {args.prefix}{args.seeded} HTTP/1.1\r\nHost: bare\r\n\r\n".encode()
+        link.write(raw[:len(raw) // 2])
+        time.sleep(0.1)
+        link.write(raw[len(raw) // 2:])
+        resp = read_response(link, args.timeout)
+        print(f"  GET {args.seeded} in two writes: {len(resp)} bytes, "
+              f"status {status_of(resp) or '-'}")
+        if status_of(resp) != 200:
+            failures.append(f"split request returned {status_of(resp)}, expected 200")
+
+        print("6. the connection must have survived all of it")
         resp = get(args.prefix + args.seeded, f"GET {args.seeded} again")
         if status_of(resp) != 200:
-            failures.append("connection did not survive: keep-alive is broken")
+            failures.append("connection did not survive: the stream is broken")
     finally:
         link.close()
 
@@ -264,7 +259,7 @@ def main():
             print(f"FAIL: {failure}")
         return 1
 
-    print("PASS: download, upload, round-trip and 404 all served on one connection")
+    print("PASS: downloads, 405, 404, reassembly and recovery on one connection")
     return 0
 
 

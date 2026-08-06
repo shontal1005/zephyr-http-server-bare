@@ -9,9 +9,10 @@ menuconfig RAW_HTTP_SERVER
 	select HTTP_PARSER
 	select NET_BUF
 	help
-	  Serve file downloads and uploads over HTTP/1.1 on bare data buffers
+	  Serve file downloads (GET only) over HTTP/1.1 on bare data buffers
 	  - a UART, a USB endpoint, shared memory - with no sockets, L2, IP
-	  or TCP in the image.
+	  or TCP in the image. Packets carry arbitrary chunks of the request
+	  byte stream; the server reassembles split requests itself.
 
 	  NETWORKING is selected only because the HTTP request parser
 	  library's Kconfig lives under it. The heavy parts (native IP stack,
@@ -29,6 +30,16 @@ config RAW_HTTP_URL_MAX
 	  filesystem path, so this bounds that too. Costs this many bytes
 	  per server instance.
 
+config RAW_HTTP_HEAD_MAX
+	int "Longest accepted request head"
+	default 1024
+	help
+	  Request heads are assembled in an internal buffer of this size, so
+	  a request may arrive split across any number of packets. A head
+	  that outgrows it is answered with 431 Request Header Fields Too
+	  Large. Bodies are never buffered - they are discarded by length as
+	  they stream past. Costs this many bytes per server instance.
+
 config RAW_HTTP_FILE_CHUNK
 	int "Bytes read from the filesystem per output callback"
 	default 1600
@@ -36,8 +47,6 @@ config RAW_HTTP_FILE_CHUNK
 	  Responses - heads and download chunks alike - are staged in an
 	  internal buffer of this size, so it costs this many bytes per
 	  server instance. Must be at least 96, the longest response head.
-	  Uploads do not use this - body fragments are written to the file
-	  straight from the request packet.
 
 config RAW_HTTP_THREAD_STACK_SIZE
 	int "Server thread stack size"

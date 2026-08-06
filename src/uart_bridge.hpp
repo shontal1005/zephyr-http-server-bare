@@ -20,7 +20,6 @@
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net_buf.h>
-#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/ring_buffer.h>
 
 #include <raw_http_server.hpp>
@@ -98,9 +97,10 @@ class UartBridge {
    * @brief Package the RX ring into packets for the server, forever.
    *
    * Sleeps on the semaphore until the ISR signals new bytes, then wraps
-   * them in net_bufs and hands them to enqueue_packet(). The server's
-   * own thread does the parsing, the file I/O and the response
-   * transmission - packets queue up while it is busy.
+   * them in net_bufs and hands them to enqueue_packet(). Packets are
+   * arbitrary chunks - the server reassembles the byte stream, so no
+   * framing happens here. The server's own thread does the parsing,
+   * the file I/O and the response transmission.
    */
   void feed_loop();
 
@@ -110,8 +110,6 @@ class UartBridge {
   struct ring_buf _rx_ring{};
   /** Absorbs bytes arriving while the packet pool is exhausted. */
   uint8_t _rx_ring_buf[UART_BRIDGE_RING_SIZE]{};
-  /** ISR sets this on ring overflow; the feed thread sends the marker. */
-  atomic_t _rx_overflowed{0};
   struct k_sem _rx_sem{};
   struct k_thread _feed_thread{};
 };

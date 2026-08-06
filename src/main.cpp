@@ -11,7 +11,7 @@
  * There is no network stack in this image: no L2 driver, no IP, no TCP, no
  * sockets. A UART is wired straight into RawHttpServer, so bytes arriving on
  * the wire become HTTP requests and the responses go back out of the same
- * UART. GET downloads a file, PUT and POST upload one.
+ * UART. GET downloads a file; that is the whole surface.
  */
 
 #include <errno.h>
@@ -45,29 +45,53 @@ static struct fs_mount_t files_mount = {
     .storage_dev = (void*)PARTITION_ID(storage_partition),
 };
 
-/* A file to download, so the sample has something to serve out of the box. */
-static int seed_demo_file(void) {
-  static const char body[] = "hello from the bare HTTP server\n";
+/* GET is the whole surface, so the multi-chunk test file cannot be uploaded;
+ * seed it at boot instead. The size exceeds CONFIG_RAW_HTTP_FILE_CHUNK, so
+ * downloading it takes several chunks, and the pattern is position-dependent,
+ * mirrored by the test suite's payload_of(): a mismatch shows its offset.
+ */
+#define BIG_FILE_SIZE 5035
+
+/* Write one file, overwriting; fail loudly on a short write. */
+static int seed_file(const char* path, const uint8_t* body, size_t len) {
   struct fs_file_t file;
   int ret;
 
   fs_file_t_init(&file);
 
-  ret =
-      fs_open(&file, FILES_MOUNT_POINT "/hello.txt", FS_O_CREATE | FS_O_WRITE);
+  ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
   if (ret < 0) {
     return ret;
   }
 
-  ret = fs_write(&file, body, sizeof(body) - 1);
+  ret = fs_write(&file, body, len);
   (void)fs_close(&file);
 
   /* A short write (e.g. no free space) would silently truncate the demo. */
-  if (ret >= 0 && ret != (int)(sizeof(body) - 1)) {
+  if (ret >= 0 && ret != (int)len) {
     return -EIO;
   }
 
   return ret < 0 ? ret : 0;
+}
+
+/* Files to download, so the sample has something to serve out of the box. */
+static int seed_demo_files(void) {
+  static const char body[] = "hello from the bare HTTP server\n";
+  static uint8_t big[BIG_FILE_SIZE];
+  int ret;
+
+  ret = seed_file(FILES_MOUNT_POINT "/hello.txt", (const uint8_t*)body,
+                  sizeof(body) - 1);
+  if (ret < 0) {
+    return ret;
+  }
+
+  for (size_t i = 0; i < sizeof(big); i++) {
+    big[i] = (uint8_t)(i * 7 + i / 251);
+  }
+
+  return seed_file(FILES_MOUNT_POINT "/big.bin", big, sizeof(big));
 }
 
 /* Packet size only sets how RX bytes are chunked on the way to the server. */
@@ -91,16 +115,18 @@ static UartBridge bridge(DEVICE_DT_GET(DT_ALIAS(http_uart)), &http_packet_pool);
  * terminal attached. The responses go out of the UART like any other.
  */
 static const char* const selftest_requests[] = {
-    /* download the seeded file */
+    /* download the seeded file -> 200 */
     "GET " FILES_MOUNT_POINT "/hello.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
-    /* upload a new one ... */
+    /* a missing file -> 404, and the next request is unaffected */
+    "GET " FILES_MOUNT_POINT "/missing.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+    /* an upload -> 405, its body skipped exactly: GET is the surface */
     "PUT " FILES_MOUNT_POINT
     "/upload.txt HTTP/1.1\r\nHost: bare\r\n"
-    "Content-Length: 21\r\n\r\nuploaded over a UART\n",
-    /* ... and read it back */
-    "GET " FILES_MOUNT_POINT "/upload.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
-    /* a missing file 404s and the stream keeps serving */
-    "GET " FILES_MOUNT_POINT "/missing.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
+    "Content-Length: 3\r\n\r\nhi\n",
+    /* bytes that are not HTTP -> a single 400, then the stream heals */
+    "this is not HTTP\r\n\r\n",
+    /* split across two packets on purpose: the server reassembles */
+    "GET " FILES_MOUNT_POINT "/hello.txt HTTP/1.1\r\nHost: bare\r\n\r\n",
 };
 
 /* Wrap a slice of a request in a packet and queue it for the server. */
@@ -124,17 +150,18 @@ static void run_selftest(RawHttpServer& server) {
   ARRAY_FOR_EACH(selftest_requests, i) {
     const char* request = selftest_requests[i];
     size_t len = strlen(request);
-    size_t first = len / 2;
+    /* The last request goes in two packets to demonstrate reassembly;
+     * the others each ride one packet. The responses come out of the
+     * UART asynchronously, from the server's thread.
+     */
+    size_t first = (i == ARRAY_SIZE(selftest_requests) - 1) ? len / 2 : len;
     int ret;
 
-    LOG_INF("--> request %zu: feeding %zu bytes in two packets", i + 1, len);
+    LOG_INF("--> request %zu: %zu bytes in %s", i + 1, len,
+            first == len ? "one packet" : "two packets");
 
-    /* Split on purpose: the server does not care about packet
-     * boundaries, only about the byte stream. The responses come
-     * out of the UART asynchronously, from the server's thread.
-     */
     ret = enqueue_selftest_bytes(server, request, first);
-    if (ret == 0) {
+    if (ret == 0 && first < len) {
       ret = enqueue_selftest_bytes(server, request + first, len - first);
     }
 
@@ -158,9 +185,9 @@ int main(void) {
     return ret;
   }
 
-  ret = seed_demo_file();
+  ret = seed_demo_files();
   if (ret < 0) {
-    LOG_WRN("Cannot seed the demo file (%d)", ret);
+    LOG_WRN("Cannot seed the demo files (%d)", ret);
   }
 
   LOG_INF("Serving files from %s", FILES_MOUNT_POINT);
